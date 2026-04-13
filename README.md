@@ -32,7 +32,7 @@ The config page handles Spotify OAuth login. You need to host it yourself:
 
 1. Fork the [playback_config](https://github.com/alex523ap/playback_config) repo
 2. Enable GitHub Pages in repo settings (deploy from `main` branch)
-3. Update the [Redirect URL](https://github.com/alex523ap/Playback-for-Spotify/blob/efab8a25782437fd5ffa348742ecea22f6f1f143/src/pkjs/spotify_auth.js#L4) in your Spotify app to match your GitHub Pages URL
+3. Update the [Redirect URL](https://github.com/alex523ap/Playback-for-Spotify/blob/efab8a25782437fd5ffa348742ecea22f6f1f143/src/pkjs/spotify_auth.js#L4) in your Spotify app and playback_config index.html Redirect URL to match your GitHub Pages URL
 
 ### 2. Create a Spotify App
 

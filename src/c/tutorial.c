@@ -1,7 +1,7 @@
 #include "tutorial.h"
 
 #define TUTORIAL_PERSIST_KEY 42
-#define NUM_PAGES 3
+#define NUM_PAGES 5
 
 static Window *s_window;
 static TextLayer *s_title_layer;
@@ -13,7 +13,9 @@ static void (*s_done_cb)(void);
 static const char *s_titles[] = {
   "Welcome!",
   "Now Playing",
-  "Volume"
+  "Volume",
+  "Shuffle/Repeat",
+  "Add to Queue"
 };
 
 static const char *s_bodies[] = {
@@ -26,14 +28,23 @@ static const char *s_bodies[] = {
   "UP = Next track\n"
   "DOWN = Previous\n"
   "SELECT = Play/Pause\n\n"
-  "Hold UP = Vol +\n"
-  "Hold DOWN = Vol -",
+  "Hold UP = +15s\n"
+  "Hold DOWN = -15s",
 
   "Hold SELECT to\n"
   "enter Volume Mode.\n\n"
   "In Volume Mode:\n"
   "UP/DOWN = Volume\n"
-  "Auto-reverts in 3s"
+  "Auto-reverts in 3s",
+
+  "Hold SELECT on\n"
+  "'Now Playing' to\n"
+  "toggle Shuffle &\n"
+  "Repeat mode.",
+
+  "Hold SELECT on\n"
+  "a 'Liked Song'\n"
+  "to queue it."
 };
 
 static void update_page(void) {

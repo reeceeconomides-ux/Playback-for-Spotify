@@ -12,8 +12,8 @@ typedef enum {
   MUSIC_CMD_PREV,
   MUSIC_CMD_VOL_UP,
   MUSIC_CMD_VOL_DOWN,
-  MUSIC_CMD_LIKE,
-  MUSIC_CMD_DISLIKE
+  MUSIC_CMD_SEEK_FWD,
+  MUSIC_CMD_SEEK_BACK
   } MusicCommand;
 
 typedef void (*MusicCommandCallback)(MusicCommand cmd);

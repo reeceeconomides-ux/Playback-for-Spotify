@@ -1,16 +1,16 @@
 // Spotify OAuth - Implicit Grant via Pebble config page
 
-var SPOTIFY_CLIENT_ID = '';
-// If you're forking this repo: host your own copy of the config page
-// (see the playback_config repo) on GitHub Pages and put its URL here.
-// This page is what Spotify redirects back to after the OAuth flow.
-var SPOTIFY_REDIRECT_URI = '';
+var SPOTIFY_CLIENT_ID = '0b9be8bdf4ae48d29bde7e52220d5b5e';
+var SPOTIFY_REDIRECT_URI = 'https://alex523ap.github.io/playback_config/';
 var SPOTIFY_SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private user-library-read user-library-modify user-follow-read';
 
 var TOKEN_KEY = 'spotify_token';
 var EXPIRY_KEY = 'spotify_token_expiry';
 var REFRESH_KEY = 'spotify_refresh_token';
 var CLIENT_ID_KEY = 'spotify_client_id';
+
+// Set to the full "pebblejs://close#..." link for emulator testing, or null for store builds.
+var DEBUG_RESPONSE = null;
 
 var refreshInProgress = false;
 var refreshQueue = [];
@@ -27,16 +27,29 @@ function saveToken(token, expiresIn, clientId, refreshToken) {
   }
 }
 
+// Handle debug response override
+if (DEBUG_RESPONSE) {
+  try {
+    var decoded = decodeURIComponent(DEBUG_RESPONSE.split('#')[1]);
+    var data = JSON.parse(decoded);
+    if (data.token) {
+      saveToken(data.token, data.expiresIn || 3600, data.clientId, data.refreshToken);
+      console.log('[playback] Debug token loaded');
+    }
+  } catch (e) {
+    console.log('[playback] Debug parse error: ' + e.message);
+  }
+}
+
 function getToken() {
-  var token = localStorage.getItem(TOKEN_KEY);
-  var expiry = parseInt(localStorage.getItem(EXPIRY_KEY), 10);
-  // Return token even if expired, apiRequest will trigger refresh
-  return token;
+  return localStorage.getItem(TOKEN_KEY);
 }
 
 function isTokenExpired() {
-  var expiry = parseInt(localStorage.getItem(EXPIRY_KEY), 10);
-  return !expiry || Date.now() > (expiry - 60000); // 1 min buffer
+  if (DEBUG_RESPONSE) return false; // Prevent refresh loops in debug mode
+  var expiryTime = localStorage.getItem(EXPIRY_KEY);
+  if (!expiryTime) return true;
+  return Date.now() > parseInt(expiryTime, 10);
 }
 
 function refreshAccessToken(callback) {
@@ -113,7 +126,7 @@ function clearToken() {
 }
 
 function isAuthenticated() {
-  return localStorage.getItem(REFRESH_KEY) !== null;
+  return !!getToken();
 }
 
 function init(onAuthChange) {

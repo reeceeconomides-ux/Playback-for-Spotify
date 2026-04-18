@@ -1,6 +1,6 @@
 #include "controls.h"
 
-#define LONG_PRESS_MS 3000
+#define LONG_PRESS_MS 1000
 #define MODE_REVERT_MS 3000
 
 static ControlMode s_mode = CONTROL_MODE_TRACK;
@@ -67,11 +67,17 @@ static void select_long_click(ClickRecognizerRef r, void *ctx) {
 }
 
 static void up_long_click(ClickRecognizerRef r, void *ctx) {
-  if (s_cmd_cb) s_cmd_cb(MUSIC_CMD_VOL_UP);
+  // Volume Mode already uses single-click UP for volume — don't overload
+  // long-press with seek there, it'd just fight the mode.
+  if (s_mode == CONTROL_MODE_TRACK && s_cmd_cb) {
+    s_cmd_cb(MUSIC_CMD_SEEK_FWD);
+  }
 }
 
 static void down_long_click(ClickRecognizerRef r, void *ctx) {
-  if (s_cmd_cb) s_cmd_cb(MUSIC_CMD_VOL_DOWN);
+  if (s_mode == CONTROL_MODE_TRACK && s_cmd_cb) {
+    s_cmd_cb(MUSIC_CMD_SEEK_BACK);
+  }
 }
 
 void controls_click_config_provider(void *context) {

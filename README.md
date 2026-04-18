@@ -11,6 +11,8 @@ Control Spotify from your Pebble smartwatch. Browse playlists, artists, albums a
 - **Playback controls** — play/pause, next/previous track
 - **Volume control** — hold UP/DOWN to adjust volume (currently only while playing on external speakers)
 - **Browse library** — playlists, artists, albums, liked songs
+- **Queue control** — long-press a song to add it to your queue; preview the queue anytime
+- **Shuffle & repeat** — toggle shuffle and cycle repeat mode with long press select on 'Now Playing' (off / context / track)
 - **Album art** — full-color on color watches, Floyd-Steinberg dithered on B&W
 - **First-launch tutorial** — quick guide to controls
 
@@ -67,6 +69,22 @@ pebble build
 pebble install --emulator basalt   # emulator
 pebble install --phone IP_ADDRESS  # real watch
 ```
+
+## Testing on Emulator
+
+The emulator can't reach the phone's config page, so OAuth has to be completed manually in a browser and the resulting token URL pasted into the source:
+
+1. Open your deployed config page in a regular browser (the GitHub Pages URL from setup).
+2. Enter your Client ID and log in with Spotify as you normally would.
+3. On the success page, right-click the **Return to Pebble** button and copy its link — it looks like `pebblejs://close#access_token=...&expires_in=3600&...`.
+4. In `src/pkjs/spotify_auth.js`, replace `null` on this line with the copied string:
+   ```js
+   var DEBUG_RESPONSE = 'pebblejs://close#access_token=...';
+   ```
+5. Rebuild and reinstall: `pebble build && pebble install --emulator basalt`.
+6. Token is valid for 1 hour only
+
+Remember to set `DEBUG_RESPONSE` back to `null` before building for the store — tokens expire in an hour and are user-specific.
 
 ## License
 

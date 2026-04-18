@@ -5,7 +5,8 @@
 typedef void (*ImageReadyCallback)(GBitmap *bitmap);
 typedef void (*StatusCallback)(const char *status);
 typedef void (*TrackInfoCallback)(const char *title, const char *artist,
-                                  int duration, int elapsed, bool is_playing);
+                                  int duration, int elapsed, bool is_playing,
+                                  bool shuffle, int repeat_state);
 typedef void (*ListItemCallback)(int list_type, int index, int count,
                                  const char *title, const char *subtitle,
                                  const char *uri);

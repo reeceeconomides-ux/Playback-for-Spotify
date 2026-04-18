@@ -14,7 +14,14 @@ static bool s_np_visible = false;
 static bool s_playing = false;
 static int s_elapsed = 0;
 static int s_total = 0;
+static bool s_shuffle = false;
+static int s_repeat_state = 0; // 0=off, 1=context, 2=track
 static AppTimer *s_tick_timer = NULL;
+
+// Exposed for the More submenu (more.c) so it can show the current
+// shuffle/repeat state on open without re-fetching.
+bool main_get_shuffle(void) { return s_shuffle; }
+int  main_get_repeat(void)  { return s_repeat_state; }
 
 // --- Progress timer (local interpolation between Spotify polls) ---
 
@@ -48,21 +55,30 @@ static void image_ready_cb(GBitmap *bitmap) {
 
 static void status_cb(const char *status) {
   ui_set_status(status);
+  list_set_status(status);
+  if (strcmp(status, "Added to queue") == 0) {
+    vibes_short_pulse();
+  }
 }
 
 static void track_info_cb(const char *title, const char *artist,
-                           int duration, int elapsed, bool is_playing) {
+                           int duration, int elapsed, bool is_playing,
+                           bool shuffle, int repeat_state) {
   APP_LOG(APP_LOG_LEVEL_DEBUG, "track_info_cb enter");
 
   // Update playback state
   s_total = duration;
   s_elapsed = elapsed;
   s_playing = is_playing;
+  s_shuffle = shuffle;
+  s_repeat_state = repeat_state;
 
   // Update Now Playing UI (no-ops if window not showing)
   APP_LOG(APP_LOG_LEVEL_DEBUG, "track_info_cb: ui update");
   ui_set_track_info(title, artist);
   ui_set_progress(elapsed, duration);
+  ui_set_shuffle(shuffle);
+  ui_set_repeat(repeat_state);
 
   // Update menu subtitle
   APP_LOG(APP_LOG_LEVEL_DEBUG, "track_info_cb: menu subtitle");
@@ -123,13 +139,24 @@ static void music_command_cb(MusicCommand cmd) {
       comm_send_command(CMD_VOLUME_DOWN, NULL);
       ui_set_status("Volume -");
       break;
-    case MUSIC_CMD_LIKE:
-      comm_send_command(CMD_LIKE_TRACK, NULL);
-      ui_set_status("Liked!");
+    case MUSIC_CMD_SEEK_FWD:
+      comm_send_command(CMD_SEEK_FORWARD, NULL);
+      ui_set_status("Forward 15s");
+      // Optimistic UI: shift progress now, the next poll reconciles.
+      if (s_total > 0) {
+        s_elapsed += 15;
+        if (s_elapsed > s_total) s_elapsed = s_total;
+        ui_set_progress(s_elapsed, s_total);
+      }
       break;
-    case MUSIC_CMD_DISLIKE:
-      comm_send_command(CMD_DISLIKE_TRACK, NULL);
-      ui_set_status("Removed");
+    case MUSIC_CMD_SEEK_BACK:
+      comm_send_command(CMD_SEEK_BACK, NULL);
+      ui_set_status("Back 15s");
+      if (s_total > 0) {
+        s_elapsed -= 15;
+        if (s_elapsed < 0) s_elapsed = 0;
+        ui_set_progress(s_elapsed, s_total);
+      }
       break;
   }
 }

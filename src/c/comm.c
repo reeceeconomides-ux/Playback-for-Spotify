@@ -39,6 +39,14 @@ static void handle_error_msg(DictionaryIterator *iter) {
   }
 }
 
+static void handle_status_msg(DictionaryIterator *iter) {
+  Tuple *t = dict_find(iter, MESSAGE_KEY_StatusMsg);
+  if (t) {
+    APP_LOG(APP_LOG_LEVEL_INFO, "JS status: %s", t->value->cstring);
+    if (s_callbacks.on_status) s_callbacks.on_status(t->value->cstring);
+  }
+}
+
 static void handle_image_header(DictionaryIterator *iter) {
   Tuple *w_tuple = dict_find(iter, MESSAGE_KEY_ImageWidth);
   Tuple *h_tuple = dict_find(iter, MESSAGE_KEY_ImageHeight);
@@ -133,18 +141,24 @@ static void handle_track_info(DictionaryIterator *iter) {
   Tuple *dur_t = dict_find(iter, MESSAGE_KEY_TrackDuration);
   Tuple *elapsed_t = dict_find(iter, MESSAGE_KEY_TrackElapsed);
   Tuple *playing_t = dict_find(iter, MESSAGE_KEY_TrackIsPlaying);
+  Tuple *shuffle_t = dict_find(iter, MESSAGE_KEY_ShuffleState);
+  Tuple *repeat_t = dict_find(iter, MESSAGE_KEY_RepeatState);
 
   const char *title = title_t ? title_t->value->cstring : "";
   const char *artist = artist_t ? artist_t->value->cstring : "";
   int duration = dur_t ? (int)dur_t->value->int32 : 0;
   int elapsed = elapsed_t ? (int)elapsed_t->value->int32 : 0;
   bool is_playing = playing_t ? (playing_t->value->int32 != 0) : false;
+  bool shuffle = shuffle_t ? (shuffle_t->value->int32 != 0) : false;
+  int repeat_state = repeat_t ? (int)repeat_t->value->int32 : 0;
 
-  APP_LOG(APP_LOG_LEVEL_INFO, "Track: %s - %s (%d/%d) %s",
-          title, artist, elapsed, duration, is_playing ? "playing" : "paused");
+  APP_LOG(APP_LOG_LEVEL_INFO, "Track: %s - %s (%d/%d) %s shuf=%d rep=%d",
+          title, artist, elapsed, duration, is_playing ? "playing" : "paused",
+          shuffle ? 1 : 0, repeat_state);
 
   if (s_callbacks.on_track_info) {
-    s_callbacks.on_track_info(title, artist, duration, elapsed, is_playing);
+    s_callbacks.on_track_info(title, artist, duration, elapsed, is_playing,
+                              shuffle, repeat_state);
   }
 }
 
@@ -163,7 +177,8 @@ static void handle_list_item(DictionaryIterator *iter) {
   const char *subtitle = sub_t ? sub_t->value->cstring : "";
   const char *uri = uri_t ? uri_t->value->cstring : "";
 
-  APP_LOG(APP_LOG_LEVEL_INFO, "List item %d/%d: %s", index + 1, count, title);
+  APP_LOG(APP_LOG_LEVEL_INFO, "List item %d/%d: title='%s' sub='%s'",
+          index + 1, count, title, subtitle);
 
   if (s_callbacks.on_list_item) {
     s_callbacks.on_list_item(list_type, index, count, title, subtitle, uri);
@@ -202,6 +217,12 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   // Error message from JS
   if (dict_find(iter, MESSAGE_KEY_ErrorMsg)) {
     handle_error_msg(iter);
+    return;
+  }
+
+  // Informational status message from JS
+  if (dict_find(iter, MESSAGE_KEY_StatusMsg)) {
+    handle_status_msg(iter);
     return;
   }
 

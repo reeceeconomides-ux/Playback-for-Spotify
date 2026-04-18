@@ -5,16 +5,14 @@ var imageTransfer = require('./image_transfer');
 var pollTimer = null;
 var POLL_INTERVAL = 5000;
 var currentVolume = 50;
-var lastTrackId = null;
 var lastImageUrl = null;
 var listSendInProgress = false;
 var lastFetchedItems = [];
+var lastFetchedListType = -1;
+var lastShuffleState = false;
+var lastRepeatState = 0; // 0=off, 1=context, 2=track
 
-// Target album-art size per platform — used to pick the smallest
-// Spotify image variant that's still big enough to cover the display
-// without upscaling. Smaller source JPEG = less to download, less to
-// decode in jpeg-js (which is the single biggest cost on the phone
-// side).
+// Target album-art size per platform
 function getTargetArtSize() {
   try {
     var platform = (Pebble.getActiveWatchInfo().platform || '');
@@ -26,9 +24,6 @@ function getTargetArtSize() {
   return 168;
 }
 
-// Spotify returns album.images sorted largest-first, usually
-// [640, 300, 64]. Pick the smallest image whose longest side is still
-// >= the target display size; fall back to the largest if none qualify.
 function pickImageUrl(images, target) {
   if (!images || images.length === 0) return null;
   var best = null;
@@ -61,50 +56,61 @@ function sendAuthStatus() {
 // --- Now Playing ---
 
 function fetchNowPlaying() {
-  if (listSendInProgress) return; // Don't collide with list transfer
+  if (listSendInProgress) return;
   api.getCurrentPlayback(function(err, data) {
     if (err) {
       console.log('[playback] Now playing error: ' + err.message);
-      // Don't stop polling — next cycle will retry (and refresh token if needed)
       return;
     }
-    if (!data || !data.item) {
-      // No active playback
-      return;
-    }
+    if (!data || !data.item) return;
 
     var track = data.item;
-    var artistNames = [];
-    if (track.artists) {
-      for (var i = 0; i < track.artists.length; i++) {
-        artistNames.push(track.artists[i].name);
+    var isEpisode = (data.currently_playing_type === 'episode') || (track.type === 'episode');
+
+    var artistLine = '';
+    var artImages = null;
+    if (isEpisode) {
+      if (track.show) {
+        artistLine = track.show.name || track.show.publisher || '';
+      }
+      artImages = (track.images && track.images.length) ? track.images
+                : (track.show && track.show.images) ? track.show.images
+                : null;
+    } else {
+      if (track.artists) {
+        var names = [];
+        for (var i = 0; i < track.artists.length; i++) {
+          names.push(track.artists[i].name);
+        }
+        artistLine = names.join(', ');
+      }
+      if (track.album && track.album.images && track.album.images.length > 0) {
+        artImages = track.album.images;
       }
     }
 
-    // Kick off the art download BEFORE we send track metadata over
-    // AppMessage. The HTTP XHR and JPEG decode happen asynchronously on
-    // the phone, so they run in parallel with the watch receiving the
-    // text info and any subsequent BLE traffic. image_transfer itself
-    // de-dupes against lastUrl, and we also skip the whole step if the
-    // album art URL hasn't changed.
-    if (track.album && track.album.images && track.album.images.length > 0) {
-      var imageUrl = pickImageUrl(track.album.images, getTargetArtSize());
+    if (artImages && artImages.length > 0) {
+      var imageUrl = pickImageUrl(artImages, getTargetArtSize());
       if (imageUrl && imageUrl !== lastImageUrl && !imageTransfer.isTransferring()) {
         lastImageUrl = imageUrl;
         imageTransfer.sendImageFromUrl(imageUrl);
       }
     }
-    lastTrackId = track.id;
+
+    lastShuffleState = !!data.shuffle_state;
+    lastRepeatState = (data.repeat_state === 'track') ? 2
+                    : (data.repeat_state === 'context') ? 1 : 0;
 
     Pebble.sendAppMessage({
       'TrackTitle': track.name || '',
-      'TrackArtist': artistNames.join(', '),
+      'TrackArtist': artistLine,
       'TrackDuration': Math.floor(track.duration_ms / 1000),
       'TrackElapsed': Math.floor((data.progress_ms || 0) / 1000),
-      'TrackIsPlaying': data.is_playing ? 1 : 0
+      'TrackIsPlaying': data.is_playing ? 1 : 0,
+      'ShuffleState': lastShuffleState ? 1 : 0,
+      'RepeatState': lastRepeatState
     }, null, null);
 
-    // Update volume tracking
     if (data.device) {
       currentVolume = data.device.volume_percent;
     }
@@ -147,7 +153,6 @@ function sendListItem(listType, items, index, count) {
   }, function() {
     sendListItem(listType, items, index + 1, count);
   }, function() {
-    // Retry once after delay
     setTimeout(function() {
       sendListItem(listType, items, index, count);
     }, 500);
@@ -155,12 +160,11 @@ function sendListItem(listType, items, index, count) {
 }
 
 function fetchAndSendList(listType, apiFn, formatFn) {
+  lastFetchedListType = listType;
   apiFn(function(err, data) {
     if (err) {
       sendError(err.message);
-      if (err.message === 'Token expired') {
-        sendAuthStatus();
-      }
+      if (err.message === 'Token expired') sendAuthStatus();
       return;
     }
     if (!data) {
@@ -183,59 +187,91 @@ function fetchAndSendList(listType, apiFn, formatFn) {
 }
 
 function formatPlaylists(data) {
-  var items = [];
-  var list = data.items || [];
-  for (var i = 0; i < list.length; i++) {
-    items.push({
-      title: list[i].name,
-      subtitle: list[i].owner ? list[i].owner.display_name : '',
-      uri: list[i].uri
-    });
-  }
-  return items;
+  return (data.items || []).map(function(i) {
+    return { title: i.name, subtitle: i.owner ? i.owner.display_name : '', uri: i.uri };
+  });
 }
 
 function formatTracks(data) {
-  var items = [];
-  var list = data.items || [];
-  for (var i = 0; i < list.length; i++) {
-    var track = list[i].track || list[i];
-    var artistName = (track.artists && track.artists.length > 0) ? track.artists[0].name : '';
-    items.push({
-      title: track.name,
-      subtitle: artistName,
-      uri: track.uri
-    });
-  }
-  return items;
+  return (data.items || []).map(function(i) {
+    var t = i.track || i;
+    return { title: t.name, subtitle: (t.artists && t.artists[0]) ? t.artists[0].name : '', uri: t.uri };
+  });
 }
 
 function formatArtists(data) {
-  var items = [];
-  var list = (data.artists && data.artists.items) || [];
-  for (var i = 0; i < list.length; i++) {
-    items.push({
-      title: list[i].name,
-      subtitle: (list[i].genres && list[i].genres.length > 0) ? list[i].genres[0] : '',
-      uri: list[i].uri
-    });
-  }
-  return items;
+  return (data.artists && data.artists.items || []).map(function(i) {
+    return { title: i.name, subtitle: (i.genres && i.genres[0]) || '', uri: i.uri };
+  });
+}
+
+function formatShows(data) {
+  return (data.items || []).map(function(i) {
+    var s = i.show || i;
+    return { title: s.name, subtitle: s.publisher || '', uri: s.uri };
+  });
 }
 
 function formatAlbums(data) {
-  var items = [];
-  var list = data.items || [];
-  for (var i = 0; i < list.length; i++) {
-    var album = list[i].album || list[i];
-    var artistName = (album.artists && album.artists.length > 0) ? album.artists[0].name : '';
-    items.push({
-      title: album.name,
-      subtitle: artistName,
-      uri: album.uri
-    });
+  return (data.items || []).map(function(i) {
+    var a = i.album || i;
+    return { title: a.name, subtitle: (a.artists && a.artists[0]) ? a.artists[0].name : '', uri: a.uri };
+  });
+}
+
+function formatQueue(data) {
+  // The API puts the now-playing track in `currently_playing` and the
+  // *upcoming* entries in `queue`. Only upcoming is shown per the
+  // product decision.
+  return (data.queue || []).map(function(t) {
+    if (!t) return { title: '', subtitle: '', uri: '' };
+    var sub = '';
+    if (t.type === 'episode' && t.show) {
+      sub = t.show.name || '';
+    } else if (t.artists && t.artists[0]) {
+      sub = t.artists[0].name;
+    }
+    return { title: t.name || '', subtitle: sub, uri: t.uri || '' };
+  });
+}
+
+// Resolve a Spotify URI to a single track/episode URI playable via the
+// queue endpoint. The queue API only accepts track: or episode: URIs,
+// so container URIs must be resolved to their first playable item.
+function resolveToTrackUri(uri, cb) {
+  if (!uri) return cb(new Error('empty uri'));
+  if (uri.indexOf(':track:') !== -1 || uri.indexOf(':episode:') !== -1) {
+    return cb(null, uri);
   }
-  return items;
+  var parts = uri.split(':');
+  var kind = parts[1], id = parts[2];
+  if (kind === 'playlist') {
+    api.getPlaylistFirstTrack(id, function(err, data) {
+      if (err) return cb(err);
+      var t = data && data.items && data.items[0] && data.items[0].track;
+      cb(null, t ? t.uri : null);
+    });
+  } else if (kind === 'album') {
+    api.getAlbumFirstTrack(id, function(err, data) {
+      if (err) return cb(err);
+      var t = data && data.items && data.items[0];
+      cb(null, t ? t.uri : null);
+    });
+  } else if (kind === 'artist') {
+    api.getArtistTopTrack(id, function(err, data) {
+      if (err) return cb(err);
+      var t = data && data.tracks && data.tracks[0];
+      cb(null, t ? t.uri : null);
+    });
+  } else if (kind === 'show') {
+    api.getShowEpisodes(id, function(err, data) {
+      if (err) return cb(err);
+      var e = data && data.items && data.items[0];
+      cb(null, e ? e.uri : null);
+    });
+  } else {
+    cb(new Error('unsupported uri'));
+  }
 }
 
 // --- Command dispatch ---
@@ -243,12 +279,6 @@ function formatAlbums(data) {
 function handleCommand(cmd, context) {
   switch (cmd) {
     case 1: // CMD_FETCH_NOW_PLAYING
-      // Just refresh metadata. Don't wipe the art dedupe keys — the
-      // watch fires this on startup (main.c) AND every time the user
-      // opens the Now Playing menu (menu.c), and clearing the dedupe
-      // made us re-download the same cover on top of the one the poll
-      // loop had just kicked off. If the track actually changed,
-      // fetchNowPlaying's normal URL comparison will catch it.
       fetchNowPlaying();
       break;
     case 2: // CMD_FETCH_PLAYLISTS
@@ -263,32 +293,16 @@ function handleCommand(cmd, context) {
     case 5: // CMD_FETCH_LIKED_SONGS
       fetchAndSendList(3, api.getLikedTracks, formatTracks);
       break;
-    case 15: // CMD_LIKE_TRACK
-      api.getCurrentPlayback(function(err, data) {
-        if (data && data.item) {
-          console.log('[playback] Liking track: ' + data.item.name + ' (' + data.item.id + ')');
-          api.saveTrack(data.item.id, function(err) {
-            if (err) console.log('[playback] Like failed: ' + err.message);
-            else console.log('[playback] Liked successfully');
-          });
-        }
-      });
+    case 6: // CMD_FETCH_SHOWS
+      fetchAndSendList(4, api.getSavedShows, formatShows);
       break;
-    case 16: // CMD_DISLIKE_TRACK
-      api.getCurrentPlayback(function(err, data) {
-        if (data && data.item) {
-          console.log('[playback] Disliking track: ' + data.item.name + ' (' + data.item.id + ')');
-          api.removeTrack(data.item.id, function(err) {
-            if (err) console.log('[playback] Dislike failed: ' + err.message);
-            else console.log('[playback] Disliked successfully');
-          });
-        }
-      });
+    case 8: // CMD_FETCH_QUEUE
+      fetchAndSendList(5, api.getQueue, formatQueue);
       break;
     case 10: // CMD_PLAY_PAUSE
       api.getCurrentPlayback(function(err, data) {
         if (err) { sendError(err.message); return; }
-        startPolling(); // Restart polling if it was stopped
+        startPolling();
         if (data && data.is_playing) {
           api.pause(function() { setTimeout(fetchNowPlaying, 300); });
         } else {
@@ -310,81 +324,112 @@ function handleCommand(cmd, context) {
       currentVolume = Math.max(0, currentVolume - 10);
       api.setVolume(currentVolume, noop);
       break;
+    case 17: // CMD_SEEK_FORWARD
+    case 18: // CMD_SEEK_BACK
+      (function(delta) {
+        api.getCurrentPlayback(function(err, data) {
+          if (err || !data || !data.item) return;
+          var pos = (data.progress_ms || 0) + delta;
+          api.seek(Math.max(0, Math.min(data.item.duration_ms, pos)), function() { 
+            setTimeout(fetchNowPlaying, 300); 
+          });
+        });
+      })(cmd === 17 ? 15000 : -15000);
+      break;
     case 20: // CMD_PLAY_CONTEXT
       if (context) {
+        var uris = null;
         if (context.indexOf(':track:') !== -1) {
-          // It's a single track (likely from Liked Songs list)
-          // To make "Next" work, we send this track and all following ones in the current list
-          var uris = [];
+          uris = [];
           var found = false;
           for (var i = 0; i < lastFetchedItems.length; i++) {
             if (lastFetchedItems[i].uri === context) found = true;
             if (found) uris.push(lastFetchedItems[i].uri);
           }
-          
-          if (uris.length === 0) uris = [context]; // Fallback
-
-          api.playContext(null, function(err) {
-            if (err) { sendError(err.message); return; }
-            setTimeout(fetchNowPlaying, 500);
-          }, { uris: uris });
-        } else {
-          // Play a regular context (playlist/album/artist)
-          api.playContext(context, function(err) {
-            if (err) { sendError(err.message); return; }
-            setTimeout(fetchNowPlaying, 500);
-          });
+          if (uris.length === 0) uris = [context];
         }
+        api.playContext(uris ? null : context, function(err) {
+          if (err) sendError(err.message);
+          else setTimeout(fetchNowPlaying, 500);
+        }, uris ? { uris: uris } : null);
+      }
+      break;
+    case 24: // CMD_TOGGLE_SHUFFLE
+      (function() {
+        var next = !lastShuffleState;
+        api.setShuffle(next, function(err) {
+          if (err) { sendError('Shuffle: ' + err.message); return; }
+          lastShuffleState = next;
+          setTimeout(fetchNowPlaying, 300);
+          if (lastFetchedListType === 5) {
+            setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
+          }
+        });
+      })();
+      break;
+    case 25: // CMD_CYCLE_REPEAT
+      (function() {
+        var next = (lastRepeatState + 1) % 3;
+        var name = ['off', 'context', 'track'][next];
+        api.setRepeat(name, function(err) {
+          if (err) { sendError('Repeat: ' + err.message); return; }
+          lastRepeatState = next;
+          setTimeout(fetchNowPlaying, 300);
+          if (lastFetchedListType === 5) {
+            setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
+          }
+        });
+      })();
+      break;
+    case 26: // CMD_QUEUE_ADD (context = URI — resolves non-tracks to first track)
+      if (context) resolveToTrackUri(context, function(err, uri) {
+        if (err || !uri) { sendError('Queue: ' + (err ? err.message : 'no track')); return; }
+        api.addToQueue(uri, function(err2) {
+          if (err2) sendError('Queue: ' + err2.message);
+          else {
+            Pebble.sendAppMessage({ 'StatusMsg': 'Added to queue' }, null, null);
+            if (lastFetchedListType === 5) {
+              setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
+            }
+          }
+        });
+      });
+      break;
+    case 21: // CMD_PLAY_SHOW
+      if (context) {
+        var marker = ':show:';
+        var showId = context.substring(context.indexOf(marker) + marker.length);
+        api.getShowEpisodes(showId, function(err, data) {
+          if (err || !data || !data.items || !data.items[0]) { sendError('No episodes'); return; }
+          api.playContext(null, function(err2) {
+            if (!err2) { startPolling(); setTimeout(fetchNowPlaying, 500); }
+          }, { uris: [data.items[0].uri] });
+        });
       }
       break;
     case 30: // CMD_FETCH_ART
-      if (context) {
-        imageTransfer.sendImageFromUrl(context);
-      }
+      if (context) imageTransfer.sendImageFromUrl(context);
       break;
   }
 }
 
-// --- Auth change handler ---
-
-function onAuthChange(authenticated) {
+auth.init(function(authed) {
   sendAuthStatus();
-  if (authenticated) {
-    startPolling();
-  } else {
-    stopPolling();
-  }
-}
-
-// --- Init ---
-
-auth.init(onAuthChange);
+  if (authed) startPolling();
+  else stopPolling();
+});
 
 Pebble.addEventListener('ready', function() {
-  console.log('[playback] JS ready');
-  Pebble.sendAppMessage({ 'JsReady': 1 }, function() {
-    console.log('[playback] Ready signal sent');
-  }, function() {
-    console.log('[playback] Ready signal failed');
-  });
-
+  Pebble.sendAppMessage({ 'JsReady': 1 });
   sendAuthStatus();
-
   if (auth.isAuthenticated()) {
     startPolling();
-    // Force immediate fetch with small delay to ensure art loads on app start
     setTimeout(fetchNowPlaying, 1000);
   }
 });
 
 Pebble.addEventListener('appmessage', function(e) {
-  console.log('[playback] appmessage received');
-
   var cmd = e.payload['Command'] || e.payload[100];
   var ctx = e.payload['CommandContext'] || e.payload[101];
-
-  if (cmd !== undefined && cmd !== null) {
-    handleCommand(cmd, ctx);
-    return;
-  }
+  if (cmd !== undefined && cmd !== null) handleCommand(cmd, ctx);
 });

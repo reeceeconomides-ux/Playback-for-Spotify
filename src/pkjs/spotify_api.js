@@ -59,7 +59,10 @@ function apiRequest(method, path, body, callback) {
       var data = JSON.parse(xhr.responseText);
       if (callback) callback(null, data);
     } catch (e) {
-      if (callback) callback(e, null);
+      // If parsing fails but the status was 200/202 (success),
+      // it means the endpoint returned an empty or plain text response
+      // (like a snapshot ID) which is normal for Shuffle, Repeat, and Queue.
+      if (callback) callback(null, null);
     }
   };
 
@@ -72,7 +75,10 @@ function apiRequest(method, path, body, callback) {
 
 module.exports = {
   getCurrentPlayback: function(cb) {
-    apiRequest('GET', '/me/player', cb);
+    // additional_types=episode so /me/player returns podcast episodes in
+    // `item` instead of nulling it out. Without this, the watch has no
+    // way to show podcast titles.
+    apiRequest('GET', '/me/player?additional_types=episode', cb);
   },
 
   getPlaylists: function(cb) {
@@ -111,16 +117,49 @@ module.exports = {
     apiRequest('PUT', '/me/player/volume?volume_percent=' + percent, cb);
   },
 
+  seek: function(positionMs, cb) {
+    apiRequest('PUT', '/me/player/seek?position_ms=' + positionMs, cb);
+  },
+
+  getSavedShows: function(cb) {
+    apiRequest('GET', '/me/shows?limit=20', cb);
+  },
+
+  getShowEpisodes: function(showId, cb) {
+    apiRequest('GET', '/shows/' + showId + '/episodes?limit=1', cb);
+  },
+
   playContext: function(contextUri, cb, customBody) {
     var body = customBody || { context_uri: contextUri };
     apiRequest('PUT', '/me/player/play', body, cb);
   },
 
-  saveTrack: function(trackId, cb) {
-    apiRequest('PUT', '/me/tracks?ids=' + trackId, cb);
+  getQueue: function(cb) {
+    apiRequest('GET', '/me/player/queue', cb);
   },
 
-  removeTrack: function(trackId, cb) {
-    apiRequest('DELETE', '/me/tracks?ids=' + trackId, cb);
+  addToQueue: function(uri, cb) {
+    apiRequest('POST', '/me/player/queue?uri=' + encodeURIComponent(uri), cb);
+  },
+
+  setShuffle: function(on, cb) {
+    apiRequest('PUT', '/me/player/shuffle?state=' + (on ? 'true' : 'false'), cb);
+  },
+
+  setRepeat: function(state, cb) {
+    // state: "off" | "context" | "track"
+    apiRequest('PUT', '/me/player/repeat?state=' + state, cb);
+  },
+
+  getPlaylistFirstTrack: function(id, cb) {
+    apiRequest('GET', '/playlists/' + id + '/tracks?limit=1&fields=items(track(uri))', cb);
+  },
+
+  getAlbumFirstTrack: function(id, cb) {
+    apiRequest('GET', '/albums/' + id + '/tracks?limit=1', cb);
+  },
+
+  getArtistTopTrack: function(id, cb) {
+    apiRequest('GET', '/artists/' + id + '/top-tracks?market=from_token', cb);
   }
 };

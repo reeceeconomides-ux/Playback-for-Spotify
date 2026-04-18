@@ -17,10 +17,10 @@
 </head>
 <body>
   <div class="settings">
-    <label>Spotify Client ID (Optional for Developers)</label>
-    <input type="text" id="clientIdInput" placeholder="Leave blank for default app">
+    <label>Spotify Client ID</label>
+    <input type="text" id="clientIdInput" placeholder="Paste your Client ID here">
     <p style="font-size: 12px; color: #666; margin-top: 8px;">
-      To bypass the 25-user limit, enter your own Client ID from the Spotify Developer Dashboard.
+      "Get your Client ID — see <a href="setup.html">Setup Guide</a>"
     </p>
   </div>
 
@@ -29,9 +29,9 @@
   <p id="debug" class="debug"></p>
 
   <script>
-    var DEFAULT_CLIENT_ID = '0b9be8bdf4ae48d29bde7e52220d5b5e';
+    var DEFAULT_CLIENT_ID = '';
     var REDIRECT_URI = 'https://alex523ap.github.io/playback_config/';
-    var SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private user-library-read user-library-modify user-follow-read';
+    var SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private user-library-read user-follow-read';
 
     // --- Parse query params ---
     function getQueryParam(name) {
@@ -115,8 +115,13 @@
     } else {
       document.getElementById('action').innerHTML = '<button class="btn" id="loginBtn">Log in with Spotify</button>';
       document.getElementById('loginBtn').onclick = function() {
+        if (!getActiveClientId()) {                                                 
+    document.getElementById('status').textContent = 'Enter your Client ID first';                                                                 
+    return;                                                                     
+        }        
         var verifier = generateRandom(64);
         sessionStorage.setItem('pkce_verifier', verifier);
+        sessionStorage.setItem('pkce_client_id', getActiveClientId());
         sha256(verifier).then(function(challenge) {
           var authUrl = 'https://accounts.spotify.com/authorize' +
             '?client_id=' + encodeURIComponent(getActiveClientId()) +

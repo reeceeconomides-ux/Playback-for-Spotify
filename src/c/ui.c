@@ -1,7 +1,8 @@
 #include "ui.h"
+#include "marquee.h"
 
 static BitmapLayer *s_art_layer;
-static TextLayer *s_title_layer;
+static MarqueeLayer *s_title_layer;
 static TextLayer *s_artist_layer;
 static TextLayer *s_time_layer;
 static Layer *s_overlay_layer;
@@ -9,7 +10,7 @@ static Layer *s_progress_layer;
 #if defined(PBL_ROUND)
 // Shadow copies drawn 1px offset behind the main labels so white text
 // stays readable on top of the dithered album art.
-static TextLayer *s_title_shadow_layer;
+static MarqueeLayer *s_title_shadow_layer;
 static TextLayer *s_artist_shadow_layer;
 static TextLayer *s_time_shadow_layer;
 #endif
@@ -21,13 +22,50 @@ static char s_status_buf_ui[64];
 static bool s_showing_status = false;
 static AppTimer *s_status_timer = NULL;
 static float s_progress = 0.0f;
+static bool s_shuffle_on = false;
+static int s_repeat_state = 0; // 0=off, 1=context, 2=track
+
+// 8x8 shuffle icon — two crossing arrows, only drawn when shuffle is on.
+static void draw_shuffle_icon(GContext *ctx, int x, int y) {
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_draw_line(ctx, GPoint(x,     y + 1), GPoint(x + 6, y + 6));
+  graphics_draw_line(ctx, GPoint(x,     y + 6), GPoint(x + 6, y + 1));
+  // arrowheads at the right tips
+  graphics_draw_line(ctx, GPoint(x + 7, y),     GPoint(x + 7, y + 2));
+  graphics_draw_line(ctx, GPoint(x + 5, y),     GPoint(x + 7, y));
+  graphics_draw_line(ctx, GPoint(x + 7, y + 5), GPoint(x + 7, y + 7));
+  graphics_draw_line(ctx, GPoint(x + 5, y + 7), GPoint(x + 7, y + 7));
+}
+
+// 8x8 repeat icon — loop rectangle with an arrow notch, optional "1"
+// inside for repeat-track. Not drawn when state == 0.
+static void draw_repeat_icon(GContext *ctx, int x, int y, int state) {
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  // Loop body (top-right broken by the arrow)
+  graphics_draw_line(ctx, GPoint(x,     y + 1), GPoint(x + 5, y + 1));
+  graphics_draw_line(ctx, GPoint(x,     y + 1), GPoint(x,     y + 6));
+  graphics_draw_line(ctx, GPoint(x,     y + 6), GPoint(x + 7, y + 6));
+  graphics_draw_line(ctx, GPoint(x + 7, y + 3), GPoint(x + 7, y + 6));
+  // Arrow pointing in to close the loop
+  graphics_draw_line(ctx, GPoint(x + 5, y),     GPoint(x + 7, y + 2));
+  graphics_draw_line(ctx, GPoint(x + 5, y + 3), GPoint(x + 7, y + 2));
+  // "1" glyph inside for repeat-track
+  if (state == 2) {
+    graphics_draw_line(ctx, GPoint(x + 3, y + 2), GPoint(x + 3, y + 5));
+    graphics_draw_pixel(ctx, GPoint(x + 2, y + 3));
+  }
+}
 
 static void status_clear_cb(void *data) {
   s_status_timer = NULL;
   s_showing_status = false;
   text_layer_set_text(s_time_layer, s_time_buf);
+  layer_mark_dirty(text_layer_get_layer(s_time_layer));
 #if defined(PBL_ROUND)
-  if (s_time_shadow_layer) text_layer_set_text(s_time_shadow_layer, s_time_buf);
+  if (s_time_shadow_layer) {
+    text_layer_set_text(s_time_shadow_layer, s_time_buf);
+    layer_mark_dirty(text_layer_get_layer(s_time_shadow_layer));
+  }
 #endif
 }
 
@@ -49,6 +87,19 @@ static void overlay_update_proc(Layer *layer, GContext *ctx) {
 #else
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+#endif
+
+  // Shuffle/repeat icons in the bottom-right corner of the overlay.
+  // Rectangular-only — round displays are too tight with the current
+  // overlay layout to fit extra glyphs without clobbering the time.
+#if !defined(PBL_ROUND)
+  int icon_y = bounds.size.h - 12;
+  if (s_shuffle_on) {
+    draw_shuffle_icon(ctx, bounds.size.w - 22, icon_y);
+  }
+  if (s_repeat_state > 0) {
+    draw_repeat_icon(ctx, bounds.size.w - 11, icon_y, s_repeat_state);
+  }
 #endif
 }
 
@@ -120,25 +171,21 @@ void ui_init(Window *window) {
   layer_add_child(root, s_overlay_layer);
 
   // --- Title (with 1px black shadow behind it) ---
-  s_title_shadow_layer = text_layer_create(GRect(text_inset + 1, title_y + 1, text_w, title_h));
-  text_layer_set_background_color(s_title_shadow_layer, GColorClear);
-  text_layer_set_text_color(s_title_shadow_layer, GColorBlack);
-  text_layer_set_font(s_title_shadow_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_title_shadow_layer, GTextAlignmentCenter);
-  text_layer_set_overflow_mode(s_title_shadow_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_title_shadow_layer, "Playback");
-  layer_add_child(s_overlay_layer, text_layer_get_layer(s_title_shadow_layer));
+  s_title_shadow_layer = marquee_layer_create(GRect(text_inset + 1, title_y + 1, text_w, title_h));
+  marquee_layer_set_font(s_title_shadow_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  marquee_layer_set_text_color(s_title_shadow_layer, GColorBlack);
+  marquee_layer_set_alignment(s_title_shadow_layer, GTextAlignmentCenter);
+  marquee_layer_set_text(s_title_shadow_layer, "Playback");
+  layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_shadow_layer));
 
-  s_title_layer = text_layer_create(GRect(text_inset, title_y, text_w, title_h));
-  text_layer_set_background_color(s_title_layer, GColorClear);
-  text_layer_set_text_color(s_title_layer, GColorWhite);
-  text_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_title_layer, GTextAlignmentCenter);
-  text_layer_set_overflow_mode(s_title_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_title_layer, "Playback");
-  layer_add_child(s_overlay_layer, text_layer_get_layer(s_title_layer));
+  s_title_layer = marquee_layer_create(GRect(text_inset, title_y, text_w, title_h));
+  marquee_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  marquee_layer_set_text_color(s_title_layer, GColorWhite);
+  marquee_layer_set_alignment(s_title_layer, GTextAlignmentCenter);
+  marquee_layer_set_text(s_title_layer, "Playback");
+  layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_layer));
 
-  // --- Artist (with shadow) ---
+  // --- Artist (with shadow). Static text — no marquee, just ellipsize. ---
   s_artist_shadow_layer = text_layer_create(GRect(text_inset + 1, artist_y + 1, text_w, artist_h));
   text_layer_set_background_color(s_artist_shadow_layer, GColorClear);
   text_layer_set_text_color(s_artist_shadow_layer, GColorBlack);
@@ -194,13 +241,12 @@ void ui_init(Window *window) {
   layer_set_update_proc(s_overlay_layer, overlay_update_proc);
   layer_add_child(root, s_overlay_layer);
 
-  s_title_layer = text_layer_create(GRect(4, 2, W - 8, 20));
-  text_layer_set_background_color(s_title_layer, GColorClear);
-  text_layer_set_text_color(s_title_layer, GColorWhite);
-  text_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_overflow_mode(s_title_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_title_layer, "Playback");
-  layer_add_child(s_overlay_layer, text_layer_get_layer(s_title_layer));
+  s_title_layer = marquee_layer_create(GRect(4, 2, W - 8, 20));
+  marquee_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  marquee_layer_set_text_color(s_title_layer, GColorWhite);
+  marquee_layer_set_alignment(s_title_layer, GTextAlignmentLeft);
+  marquee_layer_set_text(s_title_layer, "Playback");
+  layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_layer));
 
   s_artist_layer = text_layer_create(GRect(4, 21, W - 8, 18));
   text_layer_set_background_color(s_artist_layer, GColorClear);
@@ -244,10 +290,10 @@ void ui_deinit(void) {
   text_layer_destroy(s_artist_shadow_layer);
   s_artist_shadow_layer = NULL;
 #endif
-  text_layer_destroy(s_title_layer);
+  marquee_layer_destroy(s_title_layer);
   s_title_layer = NULL;
 #if defined(PBL_ROUND)
-  text_layer_destroy(s_title_shadow_layer);
+  marquee_layer_destroy(s_title_shadow_layer);
   s_title_shadow_layer = NULL;
 #endif
   layer_destroy(s_overlay_layer);
@@ -285,14 +331,30 @@ void ui_set_track_info(const char *title, const char *artist) {
   s_artist_buf[sizeof(s_artist_buf) - 1] = '\0';
 
   if (!s_title_layer) return;
-  text_layer_set_text(s_title_layer, s_title_buf);
+  marquee_layer_set_text(s_title_layer, s_title_buf);
   text_layer_set_text(s_artist_layer, s_artist_buf);
+  layer_mark_dirty(text_layer_get_layer(s_artist_layer));
 #if defined(PBL_ROUND)
-  // Keep shadow copies in sync so the darker glyph sits 1px offset
+  // Keep shadow copies in sync so the darker glyph sits 1 px offset
   // behind the white one.
-  if (s_title_shadow_layer) text_layer_set_text(s_title_shadow_layer, s_title_buf);
-  if (s_artist_shadow_layer) text_layer_set_text(s_artist_shadow_layer, s_artist_buf);
+  if (s_title_shadow_layer)  marquee_layer_set_text(s_title_shadow_layer, s_title_buf);
+  if (s_artist_shadow_layer) {
+    text_layer_set_text(s_artist_shadow_layer, s_artist_buf);
+    layer_mark_dirty(text_layer_get_layer(s_artist_shadow_layer));
+  }
 #endif
+}
+
+void ui_set_shuffle(bool on) {
+  if (s_shuffle_on == on) return;
+  s_shuffle_on = on;
+  if (s_overlay_layer) layer_mark_dirty(s_overlay_layer);
+}
+
+void ui_set_repeat(int state) {
+  if (s_repeat_state == state) return;
+  s_repeat_state = state;
+  if (s_overlay_layer) layer_mark_dirty(s_overlay_layer);
 }
 
 void ui_set_progress(int elapsed_sec, int total_sec) {
@@ -309,8 +371,12 @@ void ui_set_progress(int elapsed_sec, int total_sec) {
 
   if (!s_showing_status) {
     text_layer_set_text(s_time_layer, s_time_buf);
+    layer_mark_dirty(text_layer_get_layer(s_time_layer));
 #if defined(PBL_ROUND)
-    if (s_time_shadow_layer) text_layer_set_text(s_time_shadow_layer, s_time_buf);
+    if (s_time_shadow_layer) {
+      text_layer_set_text(s_time_shadow_layer, s_time_buf);
+      layer_mark_dirty(text_layer_get_layer(s_time_shadow_layer));
+    }
 #endif
   }
 }

@@ -10,7 +10,11 @@ var REFRESH_KEY = 'spotify_refresh_token';
 var CLIENT_ID_KEY = 'spotify_client_id';
 
 // Set to the full "pebblejs://close#..." link for emulator testing, or null for store builds.
+// Populated automatically from .env at build time via debug_env.js (gitignored).
 var DEBUG_RESPONSE = null;
+try {
+  DEBUG_RESPONSE = require('./debug_env');
+} catch (e) {}
 
 var refreshInProgress = false;
 var refreshQueue = [];

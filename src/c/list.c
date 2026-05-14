@@ -1,6 +1,8 @@
 #include "list.h"
 #include "comm.h"
 #include "marquee.h"
+#include "touch_input.h"
+#include "ui.h"
 
 // Forward declaration — implemented in main.c
 extern void now_playing_window_push(void);
@@ -13,6 +15,17 @@ static int s_item_count = 0;
 static int s_items_received = 0;
 static bool s_loading = true;
 static ListType s_current_type;
+
+// Queue: the currently-playing track shown as the pinned row 0.
+static char s_queue_current_title[40] = "";
+static char s_queue_current_artist[32] = "";
+
+// Pre-fetched queue data is ready to display without a loading delay.
+static bool s_queue_staged = false;
+
+// Auto-dismiss timer (used when the queue is opened from Now Playing).
+static AppTimer *s_dismiss_timer = NULL;
+static uint32_t s_dismiss_ms = 0;
 
 // The single "active" row marquee. Tracks whichever row the user is
 // currently looking at — the highlighted item, or the synthetic empty-
@@ -37,6 +50,15 @@ static void row_marquee_redraw(void *ctx) {
 // Resolve which text the currently-displayed row should show. Returns
 // NULL if nothing to marquee (loading state).
 static const char *current_row_text(int *out_row) {
+  if (s_current_type == LIST_TYPE_QUEUE) {
+    int row = 0;
+    if (s_list_menu) row = menu_layer_get_selected_index(s_list_menu).row;
+    if (out_row) *out_row = row;
+    if (row == 0) return s_queue_current_title[0] ? s_queue_current_title : NULL;
+    int item_row = row - 1;
+    if (item_row >= s_items_received) return NULL;
+    return s_items[item_row].title;
+  }
   if (s_loading && s_items_received == 0) return NULL;
   if (s_items_received == 0) {
     if (out_row) *out_row = 0;
@@ -50,6 +72,12 @@ static const char *current_row_text(int *out_row) {
 }
 
 static void refresh_row_marquee(void) {
+#if defined(PBL_PLATFORM_APLITE)
+  // Aplite: skip marquee. Long titles ellipsize via menu_cell_basic_draw fallback
+  // (overflows stays false → draw_row uses the plain path).
+  marquee_unregister(&s_row_marquee);
+  s_marquee_row = -1;
+#else
   int row = -1;
   const char *text = current_row_text(&row);
   if (!text || !s_list_menu) {
@@ -62,6 +90,7 @@ static void refresh_row_marquee(void) {
   int visible = b.size.w - 2 * LIST_ROW_PAD;
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
   marquee_set(&s_row_marquee, text, font, visible, row_marquee_redraw, NULL);
+#endif
 }
 
 // Draw a scrolled title (and optional subtitle) manually, bypassing
@@ -111,6 +140,20 @@ static void list_status_clear_cb(void *data) {
   if (s_list_menu) layer_mark_dirty(menu_layer_get_layer(s_list_menu));
 }
 
+static void dismiss_timer_cb(void *data) {
+  s_dismiss_timer = NULL;
+  if (s_list_window) window_stack_remove(s_list_window, true);
+}
+
+static void reset_dismiss_timer(void) {
+  if (!s_dismiss_ms) return;
+  if (s_dismiss_timer) {
+    app_timer_reschedule(s_dismiss_timer, s_dismiss_ms);
+  } else {
+    s_dismiss_timer = app_timer_register(s_dismiss_ms, dismiss_timer_cb, NULL);
+  }
+}
+
 // --- MenuLayer callbacks ---
 
 static uint16_t get_num_sections(MenuLayer *menu, void *data) {
@@ -118,6 +161,9 @@ static uint16_t get_num_sections(MenuLayer *menu, void *data) {
 }
 
 static uint16_t get_num_rows(MenuLayer *menu, uint16_t section, void *data) {
+  if (s_current_type == LIST_TYPE_QUEUE) {
+    return s_items_received + 1; // row 0 is always the current track
+  }
   if (s_loading && s_items_received == 0) return 1; // "Loading..." row
   if (!s_loading && s_items_received == 0) return 1; // Empty-state row
   return s_items_received;
@@ -148,6 +194,24 @@ static void draw_header(GContext *ctx, const Layer *cell_layer, uint16_t section
 
 static void draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index,
                      void *data) {
+  if (s_current_type == LIST_TYPE_QUEUE) {
+    int row = cell_index->row;
+    if (row == 0) {
+      const char *sub = s_queue_current_artist[0] ? s_queue_current_artist : NULL;
+      const char *title = s_queue_current_title[0] ? s_queue_current_title : "Now Playing";
+      menu_cell_basic_draw(ctx, cell_layer, title, sub, NULL);
+      return;
+    }
+    int item_row = row - 1;
+    if (item_row >= s_items_received) {
+      menu_cell_basic_draw(ctx, cell_layer, "Loading...", NULL, NULL);
+      return;
+    }
+    const char *subtitle = s_items[item_row].subtitle[0] ? s_items[item_row].subtitle : NULL;
+    menu_cell_basic_draw(ctx, cell_layer, s_items[item_row].title, subtitle, NULL);
+    return;
+  }
+
   if (s_loading && s_items_received == 0) {
     menu_cell_basic_draw(ctx, cell_layer, "Loading...", NULL, NULL);
     return;
@@ -178,6 +242,7 @@ static void draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_ind
 static void selection_changed(MenuLayer *menu, MenuIndex new_idx,
                                MenuIndex old_idx, void *data) {
   refresh_row_marquee();
+  reset_dismiss_timer();
 }
 
 static void select_long_callback(MenuLayer *menu, MenuIndex *cell_index, void *data) {
@@ -194,6 +259,24 @@ static void select_long_callback(MenuLayer *menu, MenuIndex *cell_index, void *d
 }
 
 static void select_callback(MenuLayer *menu, MenuIndex *cell_index, void *data) {
+  reset_dismiss_timer();
+
+  if (s_current_type == LIST_TYPE_QUEUE) {
+    if (cell_index->row == 0) {
+      comm_send_command(CMD_PLAY_PAUSE, NULL);
+    } else {
+      int item_row = cell_index->row - 1;
+      if (item_row >= s_items_received) return;
+      // Skipping forward in the queue — animate exit-left, enter-right.
+      ui_hint_animation_dir(false);
+      // Send the target URI; pkjs picks context+offset (preserves
+      // playlist/album context) or falls back to a uris[] tail.
+      comm_send_command(CMD_QUEUE_SKIP_TO, s_items[item_row].uri);
+    }
+    window_stack_remove(s_list_window, true);
+    return;
+  }
+
   if (s_items_received == 0) return; // "Loading..." or empty-state row
 
   int row = cell_index->row;
@@ -215,6 +298,36 @@ static void select_callback(MenuLayer *menu, MenuIndex *cell_index, void *data) 
   comm_send_command(play_cmd, s_items[row].uri);
   if (push_np) now_playing_window_push();
 }
+
+// --- Gestures ---
+
+#if HAS_TOUCH
+static void list_gesture(GestureKind kind, void *ctx) {
+  if (!s_list_menu) return;
+  reset_dismiss_timer();
+  switch (kind) {
+    case GESTURE_TAP: {
+      MenuIndex idx = menu_layer_get_selected_index(s_list_menu);
+      select_callback(s_list_menu, &idx, NULL);
+      break;
+    }
+    case GESTURE_SCROLL_UP:
+      // Finger moved UP — push content up — selection advances DOWN.
+      menu_layer_set_selected_next(s_list_menu, false, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SCROLL_DOWN:
+      // Finger moved DOWN — pull content down — selection retreats UP.
+      menu_layer_set_selected_next(s_list_menu, true, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SWIPE_LEFT:
+      window_stack_pop(true);
+      break;
+    case GESTURE_SWIPE_RIGHT:
+      // Ignored.
+      break;
+  }
+}
+#endif
 
 // --- Window handlers ---
 
@@ -241,9 +354,26 @@ static void window_load(Window *window) {
   menu_layer_set_click_config_onto_window(s_list_menu, window);
 
   layer_add_child(root, menu_layer_get_layer(s_list_menu));
+  // Initialize marquee for whatever row is selected at open time.
+  // Without this, draw_scrolling_row uses an uninitialized text_width
+  // until the first external event (e.g. an incoming list item) triggers
+  // refresh_row_marquee(), causing a visible position jump.
+  refresh_row_marquee();
+
+#if HAS_TOUCH
+  touch_input_set_handler(window, list_gesture, NULL);
+#endif
 }
 
 static void window_unload(Window *window) {
+#if HAS_TOUCH
+  touch_input_clear_handler(window);
+#endif
+  if (s_dismiss_timer) {
+    app_timer_cancel(s_dismiss_timer);
+    s_dismiss_timer = NULL;
+  }
+  s_dismiss_ms = 0;
   marquee_unregister(&s_row_marquee);
   s_marquee_row = -1;
   menu_layer_destroy(s_list_menu);
@@ -254,9 +384,13 @@ static void window_unload(Window *window) {
 
 void list_window_push(ListType type) {
   s_current_type = type;
-  s_item_count = 0;
-  s_items_received = 0;
-  s_loading = true;
+  // Use staged data for queue if available (pre-fetched after art loaded).
+  if (!(type == LIST_TYPE_QUEUE && s_queue_staged)) {
+    s_item_count = 0;
+    s_items_received = 0;
+    s_loading = true;
+  }
+  s_queue_staged = false;
 
   s_list_window = window_create();
   window_set_background_color(s_list_window, GColorBlack);
@@ -264,7 +398,7 @@ void list_window_push(ListType type) {
     .load = window_load,
     .unload = window_unload,
   });
-  window_stack_push(s_list_window, true);
+  window_stack_push(s_list_window, type != LIST_TYPE_QUEUE);
 }
 
 void list_add_item(int index, const char *title, const char *subtitle,
@@ -286,9 +420,11 @@ void list_add_item(int index, const char *title, const char *subtitle,
 
   if (s_list_menu) {
     menu_layer_reload_data(s_list_menu);
-    // Kick marquee once the initially-selected row has text. After
-    // that, selection_changed refreshes it as the user scrolls.
-    if (index == 0) refresh_row_marquee();
+    // For non-queue lists, kick the marquee when item 0 arrives since
+    // that's the initially-selected row. For the queue, row 0 is the
+    // pinned current track (not s_items[0]) and the marquee was already
+    // initialized at window_load, so skip to avoid a spurious re-measure.
+    if (index == 0 && s_current_type != LIST_TYPE_QUEUE) refresh_row_marquee();
   }
 }
 
@@ -298,6 +434,9 @@ void list_set_count(int count) {
 
 void list_mark_done(void) {
   s_loading = false;
+  if (s_current_type == LIST_TYPE_QUEUE && !s_list_menu) {
+    s_queue_staged = true;
+  }
   if (s_list_menu) {
     menu_layer_reload_data(s_list_menu);
     // If the list came back empty, this registers a marquee on the
@@ -315,4 +454,16 @@ void list_set_status(const char *status) {
 
   if (s_list_status_timer) app_timer_cancel(s_list_status_timer);
   s_list_status_timer = app_timer_register(2000, list_status_clear_cb, NULL);
+}
+
+void list_set_queue_current_track(const char *title, const char *artist) {
+  strncpy(s_queue_current_title, title, sizeof(s_queue_current_title) - 1);
+  s_queue_current_title[sizeof(s_queue_current_title) - 1] = '\0';
+  strncpy(s_queue_current_artist, artist, sizeof(s_queue_current_artist) - 1);
+  s_queue_current_artist[sizeof(s_queue_current_artist) - 1] = '\0';
+}
+
+void list_set_auto_dismiss(uint32_t timeout_ms) {
+  s_dismiss_ms = timeout_ms;
+  reset_dismiss_timer();
 }

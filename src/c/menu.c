@@ -5,6 +5,7 @@
 #include "tutorial.h"
 #include "marquee.h"
 #include "more.h"
+#include "touch_input.h"
 
 // Forward declaration — implemented in main.c
 extern void now_playing_window_push(void);
@@ -13,8 +14,14 @@ extern void now_playing_window_push(void);
 static Window *s_about_window;
 static MenuLayer *s_about_menu;
 
-#define APP_VERSION "1.0.0"
-#define NUM_ABOUT_ROWS 3
+#define APP_VERSION "1.3"
+#if defined(PBL_PLATFORM_APLITE)
+// Aplite has no tutorial (tutorial_show is a no-op stub) — skip the row.
+// Aplite also has no NP long-press feature, so no "Long Press" row.
+#define NUM_ABOUT_ROWS 2
+#else
+#define NUM_ABOUT_ROWS 4
+#endif
 
 static void tutorial_restart_done(void) {
   // Tutorial finished, return to about/menu
@@ -25,6 +32,16 @@ static uint16_t about_get_num_rows(MenuLayer *menu, uint16_t s, void *d) {
 }
 
 static void about_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *d) {
+#if defined(PBL_PLATFORM_APLITE)
+  switch (idx->row) {
+    case 0:
+      menu_cell_basic_draw(ctx, cell, "Author", "alex_pavlov", NULL);
+      break;
+    case 1:
+      menu_cell_basic_draw(ctx, cell, "Version", APP_VERSION, NULL);
+      break;
+  }
+#else
   switch (idx->row) {
     case 0:
       menu_cell_basic_draw(ctx, cell, "Tutorial", "View controls guide", NULL);
@@ -33,16 +50,55 @@ static void about_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, voi
       menu_cell_basic_draw(ctx, cell, "Author", "alex_pavlov", NULL);
       break;
     case 2:
+      menu_cell_basic_draw(ctx, cell, "Long press UP/DOWN",
+        long_press_mode_get() == LP_MODE_VOLUME ? "Volume" : "Skip 15s", NULL);
+      break;
+    case 3:
       menu_cell_basic_draw(ctx, cell, "Version", APP_VERSION, NULL);
       break;
   }
+#endif
 }
 
 static void about_select(MenuLayer *menu, MenuIndex *idx, void *d) {
+#if !defined(PBL_PLATFORM_APLITE)
   if (idx->row == 0) {
     tutorial_show(tutorial_restart_done);
+  } else if (idx->row == 2) {
+    long_press_mode_toggle();
+    menu_layer_reload_data(s_about_menu);
+  }
+#else
+  (void)idx;
+#endif
+}
+
+#if HAS_TOUCH
+static void about_gesture(GestureKind kind, void *ctx) {
+  if (!s_about_menu) return;
+  switch (kind) {
+    case GESTURE_TAP: {
+      MenuIndex idx = menu_layer_get_selected_index(s_about_menu);
+      about_select(s_about_menu, &idx, NULL);
+      break;
+    }
+    case GESTURE_SCROLL_UP:
+      // Finger moved UP — push content up — selection advances DOWN.
+      menu_layer_set_selected_next(s_about_menu, false, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SCROLL_DOWN:
+      // Finger moved DOWN — pull content down — selection retreats UP.
+      menu_layer_set_selected_next(s_about_menu, true, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SWIPE_LEFT:
+      window_stack_pop(true);
+      break;
+    case GESTURE_SWIPE_RIGHT:
+      // Ignored — too easy to misfire when scrolling diagonally.
+      break;
   }
 }
+#endif
 
 static void about_load(Window *window) {
   Layer *root = window_get_root_layer(window);
@@ -60,9 +116,15 @@ static void about_load(Window *window) {
     PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
   menu_layer_set_click_config_onto_window(s_about_menu, window);
   layer_add_child(root, menu_layer_get_layer(s_about_menu));
+#if HAS_TOUCH
+  touch_input_set_handler(window, about_gesture, NULL);
+#endif
 }
 
 static void about_unload(Window *window) {
+#if HAS_TOUCH
+  touch_input_clear_handler(window);
+#endif
   menu_layer_destroy(s_about_menu);
   s_about_menu = NULL;
 }
@@ -82,9 +144,10 @@ static MenuLayer *s_menu_layer;
 
 static char s_now_playing_subtitle[64] = "Not playing";
 
+// Queue is reachable from Now Playing (SELECT click), so it's not exposed
+// as a separate root-menu row. LIST_TYPE_QUEUE handling in list.c stays.
 static const char *s_titles[] = {
   "Now Playing",
-  "Queue",
   "Playlists",
   "Artists",
   "Albums",
@@ -92,7 +155,7 @@ static const char *s_titles[] = {
   "Podcasts",
   "About"
 };
-#define NUM_ROWS 8
+#define NUM_ROWS 7
 
 // Scroll the "Now Playing" subtitle (track title) while row 0 is
 // highlighted. Pixel-based — constant-speed regardless of glyph widths.
@@ -168,7 +231,8 @@ static void menu_selection_changed(MenuLayer *menu, MenuIndex new_idx,
 static void select_long_callback(MenuLayer *menu, MenuIndex *cell_index, void *data) {
   // Long-press on "Now Playing" opens the Shuffle/Repeat submenu.
   // Other rows ignore the long-press so it can't accidentally push a
-  // surprising window from a list row.
+  // surprising window from a list row. On aplite, more_window_push() is
+  // a no-op stub.
   if (cell_index->row == 0) {
     more_window_push();
   }
@@ -181,34 +245,59 @@ static void select_callback(MenuLayer *menu, MenuIndex *cell_index, void *data) 
       comm_send_command(CMD_FETCH_NOW_PLAYING, NULL);
       break;
     case 1:
-      list_window_push(LIST_TYPE_QUEUE);
-      comm_send_command(CMD_FETCH_QUEUE, NULL);
-      break;
-    case 2:
       list_window_push(LIST_TYPE_PLAYLISTS);
       comm_send_command(CMD_FETCH_PLAYLISTS, NULL);
       break;
-    case 3:
+    case 2:
       list_window_push(LIST_TYPE_ARTISTS);
       comm_send_command(CMD_FETCH_ARTISTS, NULL);
       break;
-    case 4:
+    case 3:
       list_window_push(LIST_TYPE_ALBUMS);
       comm_send_command(CMD_FETCH_ALBUMS, NULL);
       break;
-    case 5:
+    case 4:
       list_window_push(LIST_TYPE_LIKED_SONGS);
       comm_send_command(CMD_FETCH_LIKED_SONGS, NULL);
       break;
-    case 6:
+    case 5:
       list_window_push(LIST_TYPE_SHOWS);
       comm_send_command(CMD_FETCH_SHOWS, NULL);
       break;
-    case 7:
+    case 6:
       about_window_push();
       break;
   }
 }
+
+// --- Gestures ---
+
+#if HAS_TOUCH
+static void menu_gesture(GestureKind kind, void *ctx) {
+  if (!s_menu_layer) return;
+  switch (kind) {
+    case GESTURE_TAP: {
+      MenuIndex idx = menu_layer_get_selected_index(s_menu_layer);
+      select_callback(s_menu_layer, &idx, NULL);
+      break;
+    }
+    case GESTURE_SCROLL_UP:
+      // Finger moved UP — push content up — selection advances DOWN.
+      menu_layer_set_selected_next(s_menu_layer, false, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SCROLL_DOWN:
+      // Finger moved DOWN — pull content down — selection retreats UP.
+      menu_layer_set_selected_next(s_menu_layer, true, MenuRowAlignCenter, true);
+      break;
+    case GESTURE_SWIPE_LEFT:
+      // Root menu — BACK exits the app, so swallow this to avoid surprise.
+      break;
+    case GESTURE_SWIPE_RIGHT:
+      // Ignored.
+      break;
+  }
+}
+#endif
 
 // --- Window handlers ---
 
@@ -237,9 +326,16 @@ static void window_load(Window *window) {
 
   s_np_row_highlighted = true;  // row 0 is selected on load
   refresh_np_marquee();
+
+#if HAS_TOUCH
+  touch_input_set_handler(window, menu_gesture, NULL);
+#endif
 }
 
 static void window_unload(Window *window) {
+#if HAS_TOUCH
+  touch_input_clear_handler(window);
+#endif
   marquee_unregister(&s_np_subtitle_marquee);
   s_np_row_highlighted = false;
   menu_layer_destroy(s_menu_layer);

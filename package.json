@@ -1,7 +1,7 @@
 {
   "name": "playback",
   "author": "alex_pavlov",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "keywords": [
     "pebble-app"
   ],
@@ -35,6 +35,9 @@
       "ImageChunksTotal": 3,
       "ImageChunkIndex": 4,
       "ImageChunkData": 5,
+      "ImageSlot": 6,
+      "ImagePromote": 7,
+      "PrefetchAbort": 8,
       "RequestArtist": 10,
       "RequestAlbum": 11,
       "JsReady": 20,

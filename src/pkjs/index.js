@@ -11,6 +11,10 @@ var lastFetchedItems = [];
 var lastFetchedListType = -1;
 var lastShuffleState = false;
 var lastRepeatState = 0; // 0=off, 1=context, 2=track
+var lastContextUri = null; // playlist/album/artist URI driving playback, if any
+var manuallyQueuedSet = {}; // URIs added via CMD_QUEUE_ADD; cleared when context changes
+var lastTrackUri = null; // URI of currently playing track (for prefetch promotion)
+var prefetchTimer = null; // debounce timer for next-track art prefetch
 
 // Target album-art size per platform
 function getTargetArtSize() {
@@ -91,15 +95,34 @@ function fetchNowPlaying() {
 
     if (artImages && artImages.length > 0) {
       var imageUrl = pickImageUrl(artImages, getTargetArtSize());
-      if (imageUrl && imageUrl !== lastImageUrl && !imageTransfer.isTransferring()) {
-        lastImageUrl = imageUrl;
-        imageTransfer.sendImageFromUrl(imageUrl);
+      if (imageUrl && imageUrl !== lastImageUrl) {
+        // Fast path: if a prefetched art matches the new track, swap it in
+        // with a single ImagePromote message instead of a full transfer.
+        if (track.uri && track.uri === imageTransfer.getPrefetchedUri()) {
+          lastImageUrl = imageUrl;
+          imageTransfer.promotePrefetch();
+        } else if (!imageTransfer.isTransferring()) {
+          lastImageUrl = imageUrl;
+          // Slot-0 transfer will free C-side prefetch buffers in
+          // handle_image_header; mirror that here so getPrefetchedUri()
+          // doesn't return a URI whose bitmap no longer exists.
+          imageTransfer.dropPrefetch();
+          imageTransfer.sendImageFromUrl(imageUrl);
+        }
       }
     }
 
     lastShuffleState = !!data.shuffle_state;
     lastRepeatState = (data.repeat_state === 'track') ? 2
                     : (data.repeat_state === 'context') ? 1 : 0;
+    var newContextUri = (data.context && data.context.uri) || null;
+    if (newContextUri !== lastContextUri) {
+      manuallyQueuedSet = {};
+      imageTransfer.dropPrefetch();
+    }
+    lastContextUri = newContextUri;
+    lastTrackUri = track.uri || null;
+    schedulePrefetch();
 
     Pebble.sendAppMessage({
       'TrackTitle': track.name || '',
@@ -121,6 +144,44 @@ function startPolling() {
   if (pollTimer) return;
   fetchNowPlaying();
   pollTimer = setInterval(fetchNowPlaying, POLL_INTERVAL);
+}
+
+// --- Next-track art prefetch (emery + gabbro only) ---
+
+function schedulePrefetch() {
+  if (!imageTransfer.prefetchSupported()) return;
+  if (prefetchTimer) clearTimeout(prefetchTimer);
+  // 2s debounce: if user is actively skipping tracks, the next poll cancels
+  // the pending prefetch before it fires.
+  prefetchTimer = setTimeout(maybePrefetchNext, 2000);
+}
+
+function maybePrefetchNext() {
+  prefetchTimer = null;
+  if (listSendInProgress) return;
+  if (imageTransfer.isTransferring()) {
+    prefetchTimer = setTimeout(maybePrefetchNext, 1500);
+    return;
+  }
+  api.getQueue(function(err, data) {
+    if (err || !data || !data.queue || data.queue.length === 0) return;
+    var nextTrack = data.queue[0];
+    if (!nextTrack || !nextTrack.uri) return;
+    // Don't re-prefetch what's already buffered.
+    if (nextTrack.uri === imageTransfer.getPrefetchedUri()) return;
+
+    var artImages = null;
+    if (nextTrack.type === 'episode') {
+      artImages = (nextTrack.images && nextTrack.images.length) ? nextTrack.images
+                : (nextTrack.show && nextTrack.show.images) ? nextTrack.show.images
+                : null;
+    } else if (nextTrack.album && nextTrack.album.images && nextTrack.album.images.length) {
+      artImages = nextTrack.album.images;
+    }
+    if (!artImages || !artImages.length) return;
+    var url = pickImageUrl(artImages, getTargetArtSize());
+    if (url) imageTransfer.sendPrefetchFromUrl(url, nextTrack.uri);
+  });
 }
 
 function stopPolling() {
@@ -360,6 +421,7 @@ function handleCommand(cmd, context) {
         api.setShuffle(next, function(err) {
           if (err) { sendError('Shuffle: ' + err.message); return; }
           lastShuffleState = next;
+          imageTransfer.dropPrefetch();
           setTimeout(fetchNowPlaying, 300);
           if (lastFetchedListType === 5) {
             setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
@@ -374,6 +436,7 @@ function handleCommand(cmd, context) {
         api.setRepeat(name, function(err) {
           if (err) { sendError('Repeat: ' + err.message); return; }
           lastRepeatState = next;
+          imageTransfer.dropPrefetch();
           setTimeout(fetchNowPlaying, 300);
           if (lastFetchedListType === 5) {
             setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
@@ -387,6 +450,8 @@ function handleCommand(cmd, context) {
         api.addToQueue(uri, function(err2) {
           if (err2) sendError('Queue: ' + err2.message);
           else {
+            manuallyQueuedSet[uri] = true;
+            imageTransfer.dropPrefetch();
             Pebble.sendAppMessage({ 'StatusMsg': 'Added to queue' }, null, null);
             if (lastFetchedListType === 5) {
               setTimeout(function() { fetchAndSendList(5, api.getQueue, formatQueue); }, 500);
@@ -405,6 +470,68 @@ function handleCommand(cmd, context) {
             if (!err2) { startPolling(); setTimeout(fetchNowPlaying, 500); }
           }, { uris: [data.items[0].uri] });
         });
+      }
+      break;
+    case 27: // CMD_QUEUE_SKIP_TO — jump directly to a queue track by URI
+      if (context) {
+        (function(targetUri) {
+          stopPolling();
+          imageTransfer.dropPrefetch();
+          // Build the uris[] tail from the cached queue, target onward.
+          // Used as the fallback when context+offset isn't available.
+          var tail = [];
+          if (lastFetchedListType === 5) {
+            var found = false;
+            for (var i = 0; i < lastFetchedItems.length; i++) {
+              if (lastFetchedItems[i].uri === targetUri) found = true;
+              if (found) tail.push(lastFetchedItems[i].uri);
+            }
+          }
+          // Spotify rejects the whole uris[] body if any entry is invalid.
+          tail = tail.filter(function(u) {
+            return u && (u.indexOf(':track:') !== -1 || u.indexOf(':episode:') !== -1);
+          });
+          if (tail.length === 0) tail = [targetUri];
+
+          var afterPlay = function(err) {
+            if (err) { sendError(err.message); return; }
+            startPolling();
+            setTimeout(fetchNowPlaying, 500);
+          };
+
+          var playWithUris = function() {
+            api.playContext(null, afterPlay, { uris: tail });
+          };
+
+          // Manually queued tracks aren't in the playlist context — Spotify
+          // silently no-ops Option A (returns 204 while doing nothing) when
+          // offset.uri isn't in context_uri's tracks. Skip to Option B for those.
+          var isManual = !!manuallyQueuedSet[targetUri];
+
+          if (lastContextUri && !isManual) {
+            // Option A: jump within the playing context — preserves
+            // shuffle/repeat-context and Spotify's recommendation pool.
+            api.playContext(null, function(err) {
+              if (err) { playWithUris(); return; }
+              // Verify Spotify actually moved to the target.
+              setTimeout(function() {
+                api.getCurrentPlayback(function(verr, vdata) {
+                  if (verr) { afterPlay(null); return; }
+                  var nowUri = vdata && vdata.item && vdata.item.uri;
+                  var playing = vdata && vdata.is_playing;
+                  if (nowUri !== targetUri && !playing) {
+                    playWithUris();
+                  } else {
+                    afterPlay(null);
+                  }
+                });
+              }, 800);
+            }, { context_uri: lastContextUri, offset: { uri: targetUri } });
+          } else {
+            // Option B — pure user-queue session OR known manual queue add.
+            playWithUris();
+          }
+        })(context);
       }
       break;
     case 30: // CMD_FETCH_ART
@@ -432,4 +559,12 @@ Pebble.addEventListener('appmessage', function(e) {
   var cmd = e.payload['Command'] || e.payload[100];
   var ctx = e.payload['CommandContext'] || e.payload[101];
   if (cmd !== undefined && cmd !== null) handleCommand(cmd, ctx);
+  if (e.payload['PrefetchAbort']) {
+    // Watch couldn't allocate slot-1 or had nothing to promote. Drop our
+    // local prefetch bookkeeping and clear lastImageUrl so the next
+    // fetchNowPlaying takes the slot-0 slow path (and refreshes the
+    // currently shown art if we're already stuck).
+    imageTransfer.dropPrefetch();
+    lastImageUrl = null;
+  }
 });

@@ -4,12 +4,20 @@ function getChunkSize() {
   try {
     var platform = Pebble.getActiveWatchInfo().platform || '';
     if (platform === 'basalt' || platform === 'emery' || platform === 'gabbro') return 2000;
-  } catch (e) {}
+  } catch (e) { }
   return 1000;
 }
 
+// Slot 0 — currently displayed art
 var transferInProgress = false;
 var lastUrl = null;
+
+// Slot 1 — prefetched next-track art (emery/gabbro only)
+var prefetchInProgress = false;
+var prefetchAbort = false;
+var prefetchUrl = null;
+var prefetchTrackUri = null;
+var prefetchReady = false;
 
 function isColorPlatform() {
   try {
@@ -20,11 +28,18 @@ function isColorPlatform() {
   }
 }
 
+function prefetchSupported() {
+  try {
+    var p = Pebble.getActiveWatchInfo().platform || '';
+    return p === 'emery' || p === 'gabbro';
+  } catch (e) { return false; }
+}
+
 function sendError(msg) {
   console.log('[playback] ERROR: ' + msg);
   try {
     Pebble.sendAppMessage({ 'ErrorMsg': msg });
-  } catch (e) {}
+  } catch (e) { }
 }
 
 function arrayBufferToBytes(ab) {
@@ -65,7 +80,7 @@ function resizeAndDither(srcPixels, srcW, srcH, dstW, dstH) {
       var lum = 0;
       if (srcX >= 0 && srcX < srcW && srcY >= 0 && srcY < srcH) {
         var srcIdx = (srcY * srcW + srcX) * 4;
-        lum = 0.299 * srcPixels[srcIdx] + 0.587 * srcPixels[srcIdx+1] + 0.114 * srcPixels[srcIdx+2];
+        lum = 0.299 * srcPixels[srcIdx] + 0.587 * srcPixels[srcIdx + 1] + 0.114 * srcPixels[srcIdx + 2];
       }
       gray[y * dstW + x] = lum;
     }
@@ -112,7 +127,7 @@ function resizeAndQuantizeFit(srcPixels, srcW, srcH, dstW, dstH) {
       var srcY = Math.floor((y - offsetY) / scale);
       if (srcX >= 0 && srcX < srcW && srcY >= 0 && srcY < srcH) {
         var srcIdx = (srcY * srcW + srcX) * 4;
-        var r = srcPixels[srcIdx], g = srcPixels[srcIdx+1], b = srcPixels[srcIdx+2];
+        var r = srcPixels[srcIdx], g = srcPixels[srcIdx + 1], b = srcPixels[srcIdx + 2];
         dst[y * dstW + x] = 0xC0 | ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
       }
     }
@@ -120,7 +135,15 @@ function resizeAndQuantizeFit(srcPixels, srcW, srcH, dstW, dstH) {
   return dst;
 }
 
-function processJpeg(jpegData) {
+function resetPrefetch() {
+  prefetchInProgress = false;
+  prefetchAbort = false;
+  prefetchUrl = null;
+  prefetchTrackUri = null;
+  prefetchReady = false;
+}
+
+function processJpeg(jpegData, slot) {
   try {
     var raw = jpeg.decode(jpegData, { useTArray: true });
     var W = 144, H = 106, isRound = false;
@@ -129,96 +152,190 @@ function processJpeg(jpegData) {
       if (platform === 'emery') { W = 200; H = 166; }
       else if (platform === 'gabbro') { W = 260; H = 260; isRound = true; }
       else if (platform === 'chalk') { W = 180; H = 180; isRound = true; }
-    } catch (e) {}
+      else if (platform === 'aplite') { W = 96; H = 96; }
+    } catch (e) { }
 
     var imageData = isRound ? resizeAndQuantizeFit(raw.data, raw.width, raw.height, W, H)
-                 : isColorPlatform() ? resizeAndQuantize(raw.data, raw.width, raw.height, W, H)
-                 : resizeAndDither(raw.data, raw.width, raw.height, W, H);
+      : isColorPlatform() ? resizeAndQuantize(raw.data, raw.width, raw.height, W, H)
+        : resizeAndDither(raw.data, raw.width, raw.height, W, H);
 
-    sendImageToWatch(imageData, W, H);
+    sendImageToWatch(imageData, W, H, slot);
   } catch (ex) {
-    lastUrl = null;
-    sendError('Decode: ' + ex.message);
+    if (slot === 1) {
+      resetPrefetch();
+    } else {
+      lastUrl = null;
+      sendError('Decode: ' + ex.message);
+    }
   }
 }
 
 function downloadAndSend(url) {
   if (transferInProgress || url === lastUrl) return;
+  // Current art always wins — abort any in-flight prefetch.
+  if (prefetchInProgress) prefetchAbort = true;
   lastUrl = url;
   var xhr = new XMLHttpRequest();
   xhr.open('GET', url, true);
   xhr.responseType = 'arraybuffer';
-  xhr.onload = function() {
+  xhr.onload = function () {
     if (xhr.status === 200) {
-      processJpeg(arrayBufferToBytes(xhr.response));
+      processJpeg(arrayBufferToBytes(xhr.response), 0);
     } else {
-      // Don't pin lastUrl to a URL we failed to fetch — otherwise the
-      // early-return guard blocks every future retry for that URL.
       lastUrl = null;
       sendError('Download ' + xhr.status);
     }
   };
-  xhr.onerror = function() {
+  xhr.onerror = function () {
     lastUrl = null;
     sendError('Download failed');
   };
   xhr.send();
 }
 
-function sendImageToWatch(data, width, height) {
-  transferInProgress = true;
+function downloadPrefetch(url, trackUri) {
+  if (!prefetchSupported()) return;
+  if (transferInProgress) return;
+  if (prefetchInProgress || prefetchReady) {
+    if (url === prefetchUrl) return;
+    // A stale prefetch is in flight or buffered; clear it before queuing the new one.
+    if (prefetchInProgress) { prefetchAbort = true; return; }
+    resetPrefetch();
+  }
+  if (url === lastUrl) return;
+
+  prefetchInProgress = true;
+  prefetchAbort = false;
+  prefetchReady = false;
+  prefetchUrl = url;
+  prefetchTrackUri = trackUri;
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', url, true);
+  xhr.responseType = 'arraybuffer';
+  xhr.onload = function () {
+    if (prefetchAbort || xhr.status !== 200) {
+      resetPrefetch();
+      return;
+    }
+    processJpeg(arrayBufferToBytes(xhr.response), 1);
+  };
+  xhr.onerror = function () { resetPrefetch(); };
+  xhr.send();
+}
+
+function sendImageToWatch(data, width, height, slot) {
+  slot = slot || 0;
+  if (slot === 1) prefetchInProgress = true;
+  else transferInProgress = true;
+
   var chunkSize = getChunkSize();
   var totalChunks = Math.ceil(data.length / chunkSize);
 
-  Pebble.sendAppMessage({
+  var headerMsg = {
     'ImageWidth': width,
     'ImageHeight': height,
     'ImageDataSize': data.length,
     'ImageChunksTotal': totalChunks
-  }, function() {
-    sendChunk(data, 0, totalChunks, chunkSize);
-  }, function() {
-    transferInProgress = false;
-    lastUrl = null;
-    sendError('Header fail');
+  };
+  if (slot === 1) headerMsg['ImageSlot'] = 1;
+
+  Pebble.sendAppMessage(headerMsg, function () {
+    sendChunk(data, 0, totalChunks, chunkSize, slot);
+  }, function () {
+    if (slot === 1) {
+      resetPrefetch();
+    } else {
+      transferInProgress = false;
+      lastUrl = null;
+      sendError('Header fail');
+    }
   });
 }
 
-function sendChunk(data, index, totalChunks, chunkSize) {
+function finishChunkRun(slot) {
+  if (slot === 1) {
+    prefetchInProgress = false;
+    prefetchAbort = false;
+    prefetchReady = true;
+  } else {
+    transferInProgress = false;
+  }
+}
+
+function failChunkRun(slot) {
+  if (slot === 1) {
+    resetPrefetch();
+  } else {
+    transferInProgress = false;
+    lastUrl = null;
+    sendError('Chunk fail');
+  }
+}
+
+function sendChunk(data, index, totalChunks, chunkSize, slot) {
+  if (slot === 1 && prefetchAbort) { resetPrefetch(); return; }
+
   var start = index * chunkSize;
   var end = Math.min(start + chunkSize, data.length);
-  
-  // Convert Uint8Array to standard Array for emulator compatibility
   var chunk = [];
-  for (var i = start; i < end; i++) {
-    chunk.push(data[i]);
-  }
+  for (var i = start; i < end; i++) chunk.push(data[i]);
 
-  Pebble.sendAppMessage({
-    'ImageChunkIndex': index,
-    'ImageChunkData': chunk
-  }, function() {
-    if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize);
-    else transferInProgress = false;
-  }, function() {
-    // Retry once
-    setTimeout(function() {
-      Pebble.sendAppMessage({
-        'ImageChunkIndex': index,
-        'ImageChunkData': chunk
-      }, function() {
-        if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize);
-        else transferInProgress = false;
-      }, function() {
-        transferInProgress = false;
-        lastUrl = null;
-        sendError('Chunk fail');
+  var msg = { 'ImageChunkIndex': index, 'ImageChunkData': chunk };
+  if (slot === 1) msg['ImageSlot'] = 1;
+
+  Pebble.sendAppMessage(msg, function () {
+    if (slot === 1 && prefetchAbort) { resetPrefetch(); return; }
+    if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize, slot);
+    else finishChunkRun(slot);
+  }, function () {
+    setTimeout(function () {
+      if (slot === 1 && prefetchAbort) { resetPrefetch(); return; }
+      Pebble.sendAppMessage(msg, function () {
+        if (slot === 1 && prefetchAbort) { resetPrefetch(); return; }
+        if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize, slot);
+        else finishChunkRun(slot);
+      }, function () {
+        failChunkRun(slot);
       });
     }, 500);
   });
 }
 
+function dropPrefetch() {
+  if (prefetchInProgress) {
+    prefetchAbort = true;
+  } else {
+    resetPrefetch();
+  }
+}
+
+function promotePrefetch() {
+  if (!prefetchReady) return false;
+  var promotedUrl = prefetchUrl;
+  Pebble.sendAppMessage({ 'ImagePromote': 1 }, function () {
+    lastUrl = promotedUrl;
+    resetPrefetch();
+  }, function () {
+    // Promote failed in transit — fall back to a fresh transfer.
+    var url = prefetchUrl;
+    resetPrefetch();
+    lastUrl = null;
+    if (url) downloadAndSend(url);
+  });
+  return true;
+}
+
+function getPrefetchedUri() {
+  return prefetchReady ? prefetchTrackUri : null;
+}
+
 module.exports = {
   sendImageFromUrl: downloadAndSend,
-  isTransferring: function() { return transferInProgress; }
+  sendPrefetchFromUrl: downloadPrefetch,
+  dropPrefetch: dropPrefetch,
+  promotePrefetch: promotePrefetch,
+  getPrefetchedUri: getPrefetchedUri,
+  prefetchSupported: prefetchSupported,
+  isTransferring: function () { return transferInProgress; }
 };

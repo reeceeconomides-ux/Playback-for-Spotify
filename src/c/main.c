@@ -6,6 +6,7 @@
 #include "list.h"
 #include "playback_data.h"
 #include "tutorial.h"
+#include "touch_input.h"
 
 static Window *s_np_window;
 static bool s_np_visible = false;
@@ -18,10 +19,33 @@ static bool s_shuffle = false;
 static int s_repeat_state = 0; // 0=off, 1=context, 2=track
 static AppTimer *s_tick_timer = NULL;
 
+// Current track info (cached to populate queue row 0)
+static char s_current_title[40] = "";
+static char s_current_artist[32] = "";
+
 // Exposed for the More submenu (more.c) so it can show the current
 // shuffle/repeat state on open without re-fetching.
 bool main_get_shuffle(void) { return s_shuffle; }
 int  main_get_repeat(void)  { return s_repeat_state; }
+
+// --- Long-press mode (persisted; user-selectable in About) ---
+// Tutorial uses key 42; pick 43 to avoid collision.
+#define LONG_PRESS_PERSIST_KEY 43
+
+static LongPressMode s_long_press_mode = LP_MODE_SEEK;
+
+static void long_press_mode_load(void) {
+  s_long_press_mode = (LongPressMode)persist_read_int(LONG_PRESS_PERSIST_KEY);
+}
+
+LongPressMode long_press_mode_get(void) {
+  return s_long_press_mode;
+}
+
+void long_press_mode_toggle(void) {
+  s_long_press_mode = (s_long_press_mode == LP_MODE_SEEK) ? LP_MODE_VOLUME : LP_MODE_SEEK;
+  persist_write_int(LONG_PRESS_PERSIST_KEY, (int)s_long_press_mode);
+}
 
 // --- Progress timer (local interpolation between Spotify polls) ---
 
@@ -72,6 +96,11 @@ static void track_info_cb(const char *title, const char *artist,
   s_playing = is_playing;
   s_shuffle = shuffle;
   s_repeat_state = repeat_state;
+
+  strncpy(s_current_title, title, sizeof(s_current_title) - 1);
+  s_current_title[sizeof(s_current_title) - 1] = '\0';
+  strncpy(s_current_artist, artist, sizeof(s_current_artist) - 1);
+  s_current_artist[sizeof(s_current_artist) - 1] = '\0';
 
   // Update Now Playing UI (no-ops if window not showing)
   APP_LOG(APP_LOG_LEVEL_DEBUG, "track_info_cb: ui update");
@@ -124,10 +153,12 @@ static void music_command_cb(MusicCommand cmd) {
       ui_set_status(s_playing ? "Pausing..." : "Playing...");
       break;
     case MUSIC_CMD_NEXT:
+      ui_hint_animation_dir(false);
       comm_send_command(CMD_NEXT_TRACK, NULL);
       ui_set_status("Next...");
       break;
     case MUSIC_CMD_PREV:
+      ui_hint_animation_dir(true);
       comm_send_command(CMD_PREV_TRACK, NULL);
       ui_set_status("Previous...");
       break;
@@ -169,17 +200,80 @@ static void mode_changed_cb(ControlMode mode) {
   }
 }
 
+// --- Now Playing window click config ---
+
+static void np_up_click(ClickRecognizerRef r, void *ctx) {
+  ui_hint_animation_dir(true);   // reverse: exit right, enter from left
+  comm_send_command(CMD_PREV_TRACK, NULL);
+}
+
+static void np_down_click(ClickRecognizerRef r, void *ctx) {
+  ui_hint_animation_dir(false);  // forward: exit left, enter from right
+  comm_send_command(CMD_NEXT_TRACK, NULL);
+}
+
+static void np_select_click(ClickRecognizerRef r, void *ctx) {
+  list_set_queue_current_track(s_current_title, s_current_artist);
+  list_window_push(LIST_TYPE_QUEUE);
+  comm_send_command(CMD_FETCH_QUEUE, NULL);
+  list_set_auto_dismiss(QUEUE_TIMEOUT_MS);
+}
+
+#if !defined(PBL_PLATFORM_APLITE)
+// Hold UP/DOWN on NP: jumps in the scrubber direction (UP = earlier, DOWN
+// = later) when in SEEK mode; in VOLUME mode UP/DOWN follow the usual
+// louder/quieter convention. music_command_cb handles status text and
+// optimistic UI updates.
+static void np_up_long_click(ClickRecognizerRef r, void *ctx) {
+  music_command_cb(s_long_press_mode == LP_MODE_VOLUME ? MUSIC_CMD_VOL_UP : MUSIC_CMD_SEEK_BACK);
+}
+
+static void np_down_long_click(ClickRecognizerRef r, void *ctx) {
+  music_command_cb(s_long_press_mode == LP_MODE_VOLUME ? MUSIC_CMD_VOL_DOWN : MUSIC_CMD_SEEK_FWD);
+}
+#endif
+
+static void np_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_UP, np_up_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, np_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, np_select_click);
+#if !defined(PBL_PLATFORM_APLITE)
+  window_long_click_subscribe(BUTTON_ID_UP,   700, np_up_long_click,   NULL);
+  window_long_click_subscribe(BUTTON_ID_DOWN, 700, np_down_long_click, NULL);
+#endif
+}
+
+#if HAS_TOUCH
+static void np_gesture(GestureKind kind, void *ctx) {
+  switch (kind) {
+    case GESTURE_TAP:
+      np_select_click(NULL, NULL);
+      break;
+    case GESTURE_SWIPE_LEFT:
+      // Right-to-left = next track (matches phone music apps).
+      np_down_click(NULL, NULL);
+      break;
+    case GESTURE_SWIPE_RIGHT:
+      // Left-to-right = previous track.
+      np_up_click(NULL, NULL);
+      break;
+    case GESTURE_SCROLL_UP:
+    case GESTURE_SCROLL_DOWN:
+      // Nothing to scroll on Now Playing — ignore.
+      break;
+  }
+}
+#endif
+
 // --- Now Playing window (pushed from menu) ---
 
 static void np_window_load(Window *window) {
   s_np_visible = true;
   ui_init(window);
-  window_set_click_config_provider(window, controls_click_config_provider);
-  // Repaint the last-known album art into the freshly created bitmap
-  // layer. Without this, reopening Now Playing for the same track
-  // shows a blank cover until JS happens to push a new URL (e.g. the
-  // user hits next/previous), because the JS side de-dupes on URL and
-  // doesn't retransmit unchanged art.
+  window_set_click_config_provider(window, np_click_config_provider);
+#if HAS_TOUCH
+  touch_input_set_handler(window, np_gesture, NULL);
+#endif
   GBitmap *cached = comm_get_cached_art();
   if (cached) {
     ui_set_album_art(cached);
@@ -189,7 +283,16 @@ static void np_window_load(Window *window) {
 static void np_window_unload(Window *window) {
   s_np_visible = false;
   stop_ticking();
+#if HAS_TOUCH
+  touch_input_clear_handler(window);
+#endif
   ui_deinit();
+#if defined(PBL_PLATFORM_APLITE)
+  // Aplite has only ~4 KB free heap; the 1.2 KB album art bitmap blocks
+  // list windows from allocating their MenuLayer. Drop the cache when we
+  // leave NP — JS will re-fetch on the next poll if the user comes back.
+  comm_free_all_art();
+#endif
 }
 
 void now_playing_window_push(void) {
@@ -221,16 +324,28 @@ static void init(void) {
   };
   comm_init(cbs);
   controls_init(music_command_cb, mode_changed_cb);
+  touch_input_init();
+  long_press_mode_load();
   menu_window_push();
 
+  if (launch_reason() == APP_LAUNCH_QUICK_LAUNCH) {
+    now_playing_window_push();
+    ui_start_loading();
+  }
+
+#if !defined(PBL_PLATFORM_APLITE)
+  // Tutorial is dropped on aplite to free heap (24 KB app slot).
+  // Aplite users see the menu directly on first launch.
   if (tutorial_needed()) {
     tutorial_show(tutorial_done);
   }
+#endif
 }
 
 static void deinit(void) {
   stop_ticking();
   controls_deinit();
+  touch_input_deinit();
   comm_deinit();
 }
 

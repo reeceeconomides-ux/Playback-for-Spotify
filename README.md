@@ -72,19 +72,19 @@ pebble install --phone IP_ADDRESS  # real watch
 
 ## Testing on Emulator
 
-The emulator can't reach the phone's config page, so OAuth has to be completed manually in a browser and the resulting token URL pasted into the source:
+The emulator can't reach the phone's config page, so OAuth has to be completed manually in a browser and the resulting token URL saved to a `.env` file.
 
 1. Open your deployed config page in a regular browser (the GitHub Pages URL from setup).
 2. Enter your Client ID and log in with Spotify as you normally would.
-3. On the success page, right-click the **Return to Pebble** button and copy its link — it looks like `pebblejs://close#access_token=...&expires_in=3600&...`.
-4. In `src/pkjs/spotify_auth.js`, replace `null` on this line with the copied string:
-   ```js
-   var DEBUG_RESPONSE = 'pebblejs://close#access_token=...';
+3. On the success page, right-click the **Return to Pebble** button and copy its link — it looks like `pebblejs://close#%7B%22token%22...%7D`.
+4. Create a `.env` file at the repo root (it's gitignored):
+   ```
+   DEBUG_RESPONSE=pebblejs://close#%7B%22token%22...%7D
    ```
 5. Rebuild and reinstall: `pebble build && pebble install --emulator basalt`.
-6. Token is valid for 1 hour only
+6. The token is valid for 1 hour — update `.env` with a fresh link when it expires.
 
-Remember to set `DEBUG_RESPONSE` back to `null` before building for the store — tokens expire in an hour and are user-specific.
+The build step reads `.env` and generates `src/pkjs/debug_env.js` (also gitignored) which injects the token. Without a `.env` file, `DEBUG_RESPONSE` is `null` and production/store builds are unaffected.
 
 ## License
 

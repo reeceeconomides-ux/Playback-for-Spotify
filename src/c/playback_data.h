@@ -22,8 +22,21 @@ typedef enum {
   CMD_TOGGLE_SHUFFLE     = 24,
   CMD_CYCLE_REPEAT       = 25,
   CMD_QUEUE_ADD          = 26,
+  CMD_QUEUE_SKIP_TO      = 27, // skip forward N tracks to reach a queue position
   CMD_FETCH_ART          = 30,
 } AppCommand;
+
+// Long-press behavior on Now Playing (UP/DOWN held).
+// In LP_MODE_SEEK:   UP = back 15s, DOWN = forward 15s.
+// In LP_MODE_VOLUME: UP = volume +,  DOWN = volume -.
+// Persisted across launches; user toggles in About menu.
+typedef enum {
+  LP_MODE_SEEK   = 0,
+  LP_MODE_VOLUME = 1
+} LongPressMode;
+
+LongPressMode long_press_mode_get(void);
+void long_press_mode_toggle(void);
 
 // List types
 typedef enum {
@@ -35,6 +48,18 @@ typedef enum {
   LIST_TYPE_QUEUE        = 5
 } ListType;
 
+#if defined(PBL_PLATFORM_APLITE)
+// Aplite has only 24 KB total app slot — shrink list buffers to fit.
+// Cost: ListItem 152 → 112 B, MAX_LIST_ITEMS 20 → 8.
+// s_items[] drops from 3040 B to 896 B (saves 2144 B bss).
+#define MAX_LIST_ITEMS 8
+
+typedef struct {
+  char title[32];
+  char subtitle[24];
+  char uri[56];
+} ListItem;
+#else
 #define MAX_LIST_ITEMS 20
 
 typedef struct {
@@ -42,3 +67,4 @@ typedef struct {
   char subtitle[32];
   char uri[80];
 } ListItem;
+#endif

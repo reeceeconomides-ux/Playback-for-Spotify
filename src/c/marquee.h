@@ -50,3 +50,5 @@ void marquee_layer_set_text_color(MarqueeLayer *m, GColor color);
 // always left-aligns during scroll (see comment in marquee.c).
 void marquee_layer_set_alignment(MarqueeLayer *m, GTextAlignment align);
 void marquee_layer_set_text(MarqueeLayer *m, const char *text);
+// Stop scrolling and reset to position 0.
+void marquee_layer_stop(MarqueeLayer *m);

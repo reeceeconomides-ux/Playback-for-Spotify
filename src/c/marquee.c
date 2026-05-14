@@ -218,3 +218,10 @@ void marquee_layer_set_text(MarqueeLayer *m, const char *text) {
   marquee_set(&m->m, text, m->m.font, m->m.visible_w, ml_redraw_cb, m);
   if (m->layer) layer_mark_dirty(m->layer);
 }
+
+void marquee_layer_stop(MarqueeLayer *m) {
+  if (!m) return;
+  marquee_unregister(&m->m);
+  m->m.px_offset = 0;
+  if (m->layer) layer_mark_dirty(m->layer);
+}
